@@ -184,6 +184,34 @@ fn run_shell(snapshot: ShellSnapshot, smoke: bool) {
             ..Default::default()
         };
 
+        let background_options = WindowOptions {
+            titlebar: None,
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(0.0), px(0.0)),
+            })),
+            app_id: Some("omarchy-gpui-background".to_string()),
+            window_background: WindowBackgroundAppearance::Opaque,
+            kind: WindowKind::LayerShell(LayerShellOptions {
+                namespace: "omarchy-gpui-background".to_string(),
+                layer: Layer::Background,
+                anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                margin: Some((px(0.0), px(0.0), px(0.0), px(0.0))),
+                keyboard_interactivity: KeyboardInteractivity::None,
+                ..Default::default()
+            }),
+            focus: false,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            ..Default::default()
+        };
+        let background_window = cx
+            .open_window(background_options, move |_, cx| {
+                cx.new(|_| ui::BackgroundView::new(ui::current_background_path()))
+            })
+            .ok();
+
         cx.open_window(window_options, move |window, cx| {
             if smoke {
                 window
@@ -195,7 +223,7 @@ fn run_shell(snapshot: ShellSnapshot, smoke: bool) {
                     })
                     .detach();
             }
-            cx.new(|cx| ui::ShellView::new(snapshot, smoke, ipc_events, cx))
+            cx.new(|cx| ui::ShellView::new(snapshot, smoke, ipc_events, background_window, cx))
         })
         .expect("open Omarchy GPUI layer-shell window");
 

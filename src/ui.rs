@@ -8,8 +8,8 @@ use std::{
 };
 
 use gpui::{
-    AppContext, Bounds, Context, Div, KeyDownEvent, Render, Stateful, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
+    AppContext, Bounds, Context, Div, KeyDownEvent, ObjectFit, Render, Stateful, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, img,
     layer_shell::*, point, prelude::*, px, rgb, rgba, size,
 };
 
@@ -31,6 +31,7 @@ pub struct ShellView {
     clock: String,
     smoke: bool,
     reported_first_frame: bool,
+    background_window: Option<WindowHandle<BackgroundView>>,
     panel_id: Option<String>,
     panel_window: Option<WindowHandle<PanelView>>,
 }
@@ -40,6 +41,7 @@ impl ShellView {
         snapshot: ShellSnapshot,
         smoke: bool,
         ipc_events: IpcEventReceiver,
+        background_window: Option<WindowHandle<BackgroundView>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let events = Arc::clone(&ipc_events);
@@ -121,6 +123,7 @@ impl ShellView {
             clock: local_clock(),
             smoke,
             reported_first_frame: false,
+            background_window,
             panel_id: None,
             panel_window: None,
         }
@@ -293,6 +296,14 @@ impl ShellView {
     fn apply_ipc_event(&mut self, event: IpcEvent, cx: &mut Context<Self>) {
         match event {
             IpcEvent::Refresh => {}
+            IpcEvent::Background { path, .. } => {
+                if let Some(handle) = self.background_window.as_ref() {
+                    let _ = handle.update(cx, |view, _, cx| {
+                        view.path = PathBuf::from(path);
+                        cx.notify();
+                    });
+                }
+            }
             IpcEvent::Summon { id, payload } => {
                 if is_panel_capable(&id) {
                     self.close_panel(cx);
@@ -379,6 +390,41 @@ impl Render for ShellView {
                 cx,
             )))
     }
+}
+
+pub struct BackgroundView {
+    path: PathBuf,
+}
+
+impl BackgroundView {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Render for BackgroundView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let path = self.path.clone();
+        div()
+            .id("omarchy-gpui-background")
+            .size_full()
+            .bg(rgb(0x000000))
+            .when(!path.as_os_str().is_empty(), |background| {
+                background.child(
+                    img(path)
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .with_fallback(|| div().size_full().bg(rgb(0x000000)).into_any_element()),
+                )
+            })
+    }
+}
+
+pub fn current_background_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    fs::canonicalize(home.join(".local/state/omarchy/current/background")).unwrap_or_default()
 }
 
 struct PanelView {

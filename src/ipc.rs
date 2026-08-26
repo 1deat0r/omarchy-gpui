@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::Shutdown,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc, Mutex,
@@ -76,7 +76,7 @@ pub enum ShellCommand {
     Call {
         id: String,
         method: String,
-        arg: String,
+        args: Vec<String>,
     },
     Summon {
         id: String,
@@ -108,6 +108,7 @@ pub enum ShellCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IpcEvent {
     Refresh,
+    Background { path: String, instant: bool },
     Summon { id: String, payload: String },
     Hide { id: String },
     Toggle { id: String, payload: String },
@@ -120,17 +121,23 @@ struct IpcRuntime {
     open_panel_ids: BTreeSet<String>,
     pending_payloads: BTreeMap<String, Vec<String>>,
     dnd_enabled: bool,
+    dnd_state_path: PathBuf,
     osd_open: bool,
+    background_path: String,
 }
 
 impl IpcRuntime {
     fn new(snapshot: ShellSnapshot) -> Self {
+        let home = home_from_config_path(&snapshot.user_config_path);
+        let dnd_state_path = home.join(".local/state/omarchy/notifications.json");
         Self {
             snapshot,
             open_panel_ids: BTreeSet::new(),
             pending_payloads: BTreeMap::new(),
-            dnd_enabled: false,
+            dnd_enabled: load_dnd_state(&dnd_state_path),
+            dnd_state_path,
             osd_open: false,
+            background_path: current_background_path(&home),
         }
     }
 }
@@ -377,7 +384,7 @@ pub fn parse(args: &[String]) -> Result<ShellCommand, String> {
         Some("call") => Ok(ShellCommand::Call {
             id: required(args, 2, "plugin id")?,
             method: required(args, 3, "plugin method")?,
-            arg: args.get(4).cloned().unwrap_or_else(|| "".to_string()),
+            args: args.get(4..).unwrap_or_default().to_vec(),
         }),
         Some("summon") => Ok(ShellCommand::Summon {
             id: required(args, 2, "plugin id")?,
@@ -456,7 +463,7 @@ fn parse_direct_target(args: &[String]) -> Result<ShellCommand, String> {
     Ok(ShellCommand::Call {
         id: target,
         method,
-        arg: args.get(2).cloned().unwrap_or_default(),
+        args: args.get(2..).unwrap_or_default().to_vec(),
     })
 }
 
@@ -550,7 +557,7 @@ fn dispatch_runtime(
             });
             Ok(outcome(&id, event))
         }
-        ShellCommand::Call { id, method, arg } => dispatch_call(runtime, id, method, arg),
+        ShellCommand::Call { id, method, args } => dispatch_call(runtime, id, method, args),
         ShellCommand::Summon { id, payload } => {
             let Some(resolved) = summon_panel(runtime, id, payload) else {
                 return Ok(outcome("unknown", None));
@@ -634,8 +641,9 @@ fn dispatch_call(
     runtime: &mut IpcRuntime,
     requested_id: &str,
     method: &str,
-    arg: &str,
+    args: &[String],
 ) -> Result<CommandOutcome, String> {
+    let arg = args.first().map(String::as_str).unwrap_or_default();
     let Some(id) = resolve_call_target(&runtime.snapshot, requested_id) else {
         return Ok(outcome("unknown", None));
     };
@@ -654,7 +662,6 @@ fn dispatch_call(
 
     let result = match (id.as_str(), method) {
         ("omarchy.agents", "refresh" | "next")
-        | ("omarchy.background", "refresh")
         | ("omarchy.indicators", "refresh")
         | ("omarchy.system-update", "refresh" | "clear")
         | ("omarchy.menu", "refresh")
@@ -664,19 +671,81 @@ fn dispatch_call(
         | ("omarchy.weather", "refresh")
         | ("omarchy.nightlight", "refresh") => Ok(outcome("ok", Some(IpcEvent::Refresh))),
 
+        ("omarchy.background", "refresh") => {
+            let home = home_from_config_path(&runtime.snapshot.user_config_path);
+            runtime.background_path = current_background_path(&home);
+            Ok(outcome(
+                "",
+                Some(IpcEvent::Background {
+                    path: runtime.background_path.clone(),
+                    instant: false,
+                }),
+            ))
+        }
+        ("omarchy.background", "set" | "setInstant") => {
+            let path = required_call_arg(args, 0, "background path")?;
+            if path.trim().is_empty() {
+                Ok(outcome("", None))
+            } else {
+                runtime.background_path = path.to_string();
+                Ok(outcome(
+                    "",
+                    Some(IpcEvent::Background {
+                        path: runtime.background_path.clone(),
+                        instant: method == "setInstant",
+                    }),
+                ))
+            }
+        }
+        ("omarchy.background", "transition") => {
+            let path = required_call_arg(args, 1, "background path")?;
+            if path.trim().is_empty() {
+                Ok(outcome("", None))
+            } else {
+                runtime.background_path = path.to_string();
+                Ok(outcome(
+                    "",
+                    Some(IpcEvent::Background {
+                        path: runtime.background_path.clone(),
+                        instant: false,
+                    }),
+                ))
+            }
+        }
+        ("omarchy.background", "themeTransition") => {
+            let path = required_call_arg(args, 1, "background path")?;
+            let _final_path = required_call_arg(args, 2, "final background path")?;
+            let _colors = required_call_arg(args, 3, "colors payload")?;
+            let _shell = required_call_arg(args, 4, "shell payload")?;
+            if path.trim().is_empty() {
+                Ok(outcome("", None))
+            } else {
+                runtime.background_path = path.to_string();
+                Ok(outcome(
+                    "",
+                    Some(IpcEvent::Background {
+                        path: runtime.background_path.clone(),
+                        instant: false,
+                    }),
+                ))
+            }
+        }
+
         ("omarchy.notifications", "dndState" | "isDnd") => Ok(outcome(
             if runtime.dnd_enabled { "on" } else { "off" },
             None,
         )),
         ("omarchy.notifications", "toggleDnd") => {
             runtime.dnd_enabled = !runtime.dnd_enabled;
+            let _ = persist_dnd_state(&runtime.dnd_state_path, runtime.dnd_enabled);
             Ok(outcome(
                 if runtime.dnd_enabled { "on" } else { "off" },
                 None,
             ))
         }
         ("omarchy.notifications", "setDnd") => {
-            runtime.dnd_enabled = parse_bool_arg(arg);
+            runtime.dnd_enabled = parse_bool_arg(required_call_arg(args, 0, "DND value")?);
+            let _ = persist_dnd_state(&runtime.dnd_state_path, runtime.dnd_enabled);
             Ok(outcome(
                 if runtime.dnd_enabled { "on" } else { "off" },
                 None,
@@ -1102,6 +1171,13 @@ fn parse_bool_arg(arg: &str) -> bool {
     )
 }
 
+fn required_call_arg<'a>(args: &'a [String], index: usize, label: &str) -> Result<&'a str, String> {
+    args.get(index)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing {label}"))
+}
+
 fn parse_brightness_arg(arg: &str) -> u8 {
     arg.trim()
         .parse::<f32>()
@@ -1305,6 +1381,56 @@ fn finish_done_file(path: &str) -> Result<(), String> {
         .map_err(|error| format!("finish image selector file {}: {error}", target.display()))
 }
 
+fn current_background_path(home: &Path) -> String {
+    let path = home.join(".local/state/omarchy/current/background");
+    fs::canonicalize(path)
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+fn home_from_config_path(path: &Path) -> PathBuf {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+        })
+}
+
+fn load_dnd_state(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("dnd").cloned())
+        .map(|value| match value {
+            serde_json::Value::Bool(value) => value,
+            serde_json::Value::String(value) => parse_bool_arg(&value),
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+fn persist_dnd_state(path: &Path, enabled: bool) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("notifications state has no parent".to_string());
+    };
+    fs::create_dir_all(parent).map_err(|error| format!("create notifications state: {error}"))?;
+    let temporary = parent.join(format!("notifications.json.tmp-{}", std::process::id()));
+    let contents = serde_json::json!({"version": 3, "dnd": enabled}).to_string() + "\n";
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("write notifications state: {error}"))?;
+    fs::rename(&temporary, &path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("replace notifications state: {error}")
+    })
+}
+
 fn base64_value(value: u8) -> Option<u8> {
     match value {
         b'A'..=b'Z' => Some(value - b'A'),
@@ -1333,7 +1459,10 @@ fn positional(args: &[String], index: usize, label: &str) -> Result<String, Stri
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{IpcEvent, IpcRuntime, ShellCommand, dispatch_runtime, parse};
+    use super::{
+        IpcEvent, IpcRuntime, ShellCommand, dispatch_runtime, load_dnd_state, parse,
+        persist_dnd_state,
+    };
     use crate::config::ShellSnapshot;
 
     #[test]
@@ -1362,7 +1491,7 @@ mod tests {
             Ok(ShellCommand::Call {
                 id: "lock".to_string(),
                 method: "lock".to_string(),
-                arg: String::new(),
+                args: Vec::new(),
             })
         );
 
@@ -1385,11 +1514,57 @@ mod tests {
         assert_eq!(payload["imageDirs"], "/tmp/images");
         assert_eq!(payload["imageRows"], "Hello");
         assert_eq!(payload["filterable"], "false");
+
+        let background = parse(&args(&[
+            "background",
+            "themeTransition",
+            "/tmp/old.png",
+            "/tmp/incoming.png",
+            "/tmp/final.png",
+            "Y29sb3Jz",
+            "c2hlbGw=",
+        ]))
+        .unwrap();
+        assert_eq!(
+            background,
+            ShellCommand::Call {
+                id: "background".to_string(),
+                method: "themeTransition".to_string(),
+                args: vec![
+                    "/tmp/old.png".to_string(),
+                    "/tmp/incoming.png".to_string(),
+                    "/tmp/final.png".to_string(),
+                    "Y29sb3Jz".to_string(),
+                    "c2hlbGw=".to_string(),
+                ],
+            }
+        );
     }
 
     #[test]
     fn rejects_unknown_methods() {
         assert!(parse(&args(&["shell", "nope"])).is_err());
+    }
+
+    #[test]
+    fn notification_dnd_state_round_trips_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-gpui-dnd-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let path = root.join("notifications.json");
+        fs::create_dir_all(&root).expect("create dnd fixture directory");
+        fs::write(&path, r#"{"version":3,"dnd":true}"#).expect("write dnd fixture");
+        assert!(load_dnd_state(&path));
+        persist_dnd_state(&path, false).expect("persist dnd state");
+        assert!(!load_dnd_state(&path));
+        assert!(
+            fs::read_to_string(&path)
+                .expect("read dnd state")
+                .contains("\"dnd\":false")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1479,6 +1654,25 @@ mod tests {
             "off"
         );
 
+        let background = parse(&args(&[
+            "shell",
+            "call",
+            "background",
+            "transition",
+            "/tmp/old.png",
+            "/tmp/new.png",
+        ]))
+        .unwrap();
+        let result = dispatch_runtime(&background, &mut runtime).unwrap();
+        assert_eq!(result.output, "");
+        assert_eq!(
+            result.event,
+            Some(IpcEvent::Background {
+                path: "/tmp/new.png".to_string(),
+                instant: false,
+            })
+        );
+
         let unknown = parse(&args(&["shell", "call", "omarchy.audio", "nope"])).unwrap();
         assert_eq!(
             dispatch_runtime(&unknown, &mut runtime).unwrap().output,
@@ -1512,6 +1706,13 @@ mod tests {
             )
             .expect("write plugin fixture");
         }
+        let directory = omarchy.join("shell/plugins/omarchy.background");
+        fs::create_dir_all(&directory).expect("create background fixture");
+        fs::write(
+            directory.join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"omarchy.background","name":"Background","version":"1.0.0","kinds":["service"],"entryPoints":{"service":"Background.qml"}}"#,
+        )
+        .expect("write background fixture");
         let directory = omarchy.join("shell/plugins/omarchy.notifications");
         fs::create_dir_all(&directory).expect("create notifications fixture");
         fs::write(
