@@ -252,6 +252,7 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "monitor": snapshot.hyprland.monitor,
             "activeWindow": snapshot.hyprland.active_window,
             "activeClass": snapshot.hyprland.active_class,
+            "activeAddress": snapshot.hyprland.active_address,
             "workspaces": snapshot.hyprland.workspaces.iter().map(|workspace| serde_json::json!({
                 "id": workspace.id,
                 "name": workspace.name,
@@ -413,6 +414,7 @@ pub struct HyprlandState {
     pub monitors: Vec<MonitorState>,
     pub active_window: String,
     pub active_class: String,
+    pub active_address: String,
     pub monitor: String,
     pub error: Option<String>,
 }
@@ -562,6 +564,11 @@ pub fn parse_hyprland(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let active_address = active_window
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
     HyprlandState {
         available: monitors.is_array(),
@@ -570,6 +577,7 @@ pub fn parse_hyprland(
         monitors: parsed_monitors,
         active_window: active_title,
         active_class,
+        active_address,
         monitor: monitor
             .get("name")
             .and_then(Value::as_str)
@@ -1505,12 +1513,13 @@ mod tests {
             {"id": 2, "name": "2", "monitor": "HDMI-A-1", "windows": 3},
             {"id": 1, "name": "1", "monitor": "HDMI-A-1", "windows": 1}
         ]);
-        let active = json!({"title": "Terminal", "class": "foot"});
+        let active = json!({"title": "Terminal", "class": "foot", "address": "0x123"});
         let parsed = parse_hyprland(&monitors, Some(&workspaces), Some(&active));
         assert!(parsed.available);
         assert_eq!(parsed.active_workspace, "2");
         assert_eq!(parsed.workspaces[0].id, 1);
         assert_eq!(parsed.active_window, "Terminal");
+        assert_eq!(parsed.active_address, "0x123");
         assert_eq!(parsed.monitor, "HDMI-A-1");
     }
 

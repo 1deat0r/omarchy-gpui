@@ -8,9 +8,9 @@ use std::{
 };
 
 use gpui::{
-    AppContext, Bounds, Context, Div, KeyDownEvent, ObjectFit, Render, Stateful, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, img,
-    layer_shell::*, point, prelude::*, px, rgb, rgba, size,
+    AppContext, Bounds, ClickEvent, Context, Div, KeyDownEvent, ObjectFit, Render, Stateful,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
+    img, layer_shell::*, point, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::config::{BarEntry, ShellSnapshot};
@@ -176,17 +176,59 @@ impl ShellView {
                 group = group.child(div().w(px(span as f32)).h(px(1.0)));
                 continue;
             }
-            group = group.child(Self::chip(&label, &entry.id).when(
-                is_panel_capable(&id),
-                |chip| {
-                    chip.cursor_pointer()
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.toggle_panel(&id, cx);
-                        }))
-                },
-            ));
+            let clickable = is_panel_capable(&id) || is_bar_actionable(&id);
+            group = group.child(Self::chip(&label, &entry.id).when(clickable, |chip| {
+                chip.cursor_pointer()
+                    .on_click(cx.listener(move |view, event, window, cx| {
+                        view.handle_bar_click(&id, event, window, cx);
+                    }))
+            }));
         }
         group
+    }
+
+    fn handle_bar_click(
+        &mut self,
+        id: &str,
+        event: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match id {
+            "omarchy.active-window" => {
+                let address = self.system.hyprland.active_address.clone();
+                if address.is_empty() {
+                    return;
+                }
+                let action = if event.is_middle_click() || event.is_right_click() {
+                    "closewindow"
+                } else {
+                    "focuswindow"
+                };
+                let _ = Command::new("hyprctl")
+                    .args(["dispatch", action, &format!("address:{address}")])
+                    .spawn();
+            }
+            "omarchy.keyboard-layout" => {
+                let keyboard = self.plugins.keyboard.keyboard_name.clone();
+                if !keyboard.is_empty() {
+                    let _ = Command::new("hyprctl")
+                        .args(["switchxkblayout", &keyboard, "next"])
+                        .spawn();
+                }
+            }
+            "omarchy.microphone" => {
+                let _ = run_action(&SystemAction::ToggleInputMute);
+                cx.notify();
+            }
+            "omarchy.system-update" => {
+                let _ = Command::new("omarchy-launch-floating-terminal-with-presentation")
+                    .arg("omarchy-update")
+                    .spawn();
+            }
+            _ if is_panel_capable(id) => self.toggle_panel(id, cx),
+            _ => {}
+        }
     }
 
     fn toggle_panel(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1796,6 +1838,16 @@ fn is_panel_capable(id: &str) -> bool {
             | "omarchy.wifiqr"
             | "omarchy.media"
             | "omarchy.notifications"
+    )
+}
+
+fn is_bar_actionable(id: &str) -> bool {
+    matches!(
+        id,
+        "omarchy.active-window"
+            | "omarchy.keyboard-layout"
+            | "omarchy.microphone"
+            | "omarchy.system-update"
     )
 }
 
