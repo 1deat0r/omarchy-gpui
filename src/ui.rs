@@ -13,7 +13,7 @@ use gpui::{
 use crate::config::{BarEntry, ShellSnapshot};
 use crate::ipc::{IpcEvent, IpcEventReceiver};
 use crate::menu::{MenuItem, MenuItemKind, MenuModel};
-use crate::system::{SystemAction, SystemSnapshot, run_action};
+use crate::system::{BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action};
 
 pub struct ShellView {
     snapshot: ShellSnapshot,
@@ -370,6 +370,45 @@ impl PanelView {
                     SystemAction::SetBluetoothPower(!self.system.bluetooth.powered),
                     cx,
                 ));
+                for device in &self.system.bluetooth.devices {
+                    let action = if device.connected {
+                        BluetoothDeviceAction::Disconnect
+                    } else {
+                        BluetoothDeviceAction::Connect
+                    };
+                    let label = if device.connected {
+                        format!("Disconnect {}", device.name)
+                    } else {
+                        format!("Connect {}", device.name)
+                    };
+                    actions = actions.child(self.action_button(
+                        &label,
+                        SystemAction::BluetoothDevice {
+                            action,
+                            address: device.address.clone(),
+                        },
+                        cx,
+                    ));
+                    if !device.connected {
+                        actions = actions
+                            .child(self.action_button(
+                                &format!("Pair {}", device.name),
+                                SystemAction::BluetoothDevice {
+                                    action: BluetoothDeviceAction::Pair,
+                                    address: device.address.clone(),
+                                },
+                                cx,
+                            ))
+                            .child(self.action_button(
+                                &format!("Forget {}", device.name),
+                                SystemAction::BluetoothDevice {
+                                    action: BluetoothDeviceAction::Forget,
+                                    address: device.address.clone(),
+                                },
+                                cx,
+                            ));
+                    }
+                }
             }
             "omarchy.media" => {
                 actions = actions
@@ -393,6 +432,46 @@ impl PanelView {
                         SystemAction::SetNetworkBand(band.clone()),
                         cx,
                     ));
+                }
+                if let Some(device) = self
+                    .system
+                    .network
+                    .wifi_networks
+                    .iter()
+                    .find(|network| !network.device.is_empty())
+                    .map(|network| network.device.clone())
+                {
+                    actions = actions.child(self.action_button(
+                        "Rescan Wi-Fi",
+                        SystemAction::RescanWifi(device),
+                        cx,
+                    ));
+                }
+                for network in &self.system.network.wifi_networks {
+                    if network.ssid.is_empty() || network.device.is_empty() {
+                        continue;
+                    }
+                    let label = if network.connected {
+                        format!("Disconnect {}", network.ssid)
+                    } else {
+                        format!("Connect {}", network.ssid)
+                    };
+                    let action = if network.connected {
+                        SystemAction::DisconnectNetwork(network.device.clone())
+                    } else {
+                        SystemAction::ConnectNetwork {
+                            ssid: network.ssid.clone(),
+                            device: network.device.clone(),
+                        }
+                    };
+                    actions = actions.child(self.action_button(&label, action, cx));
+                    if network.known && !network.connected {
+                        actions = actions.child(self.action_button(
+                            &format!("Forget {}", network.ssid),
+                            SystemAction::ForgetNetwork(network.ssid.clone()),
+                            cx,
+                        ));
+                    }
                 }
             }
             "omarchy.monitor" => {

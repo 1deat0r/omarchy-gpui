@@ -62,13 +62,41 @@ pub enum SystemAction {
     MediaPrevious,
     SetBluetoothPower(bool),
     ActivateNetwork(String),
-    SetBrightness { monitor: String, percent: u8 },
-    ToggleDisplay { name: String, enabled: bool },
+    SetBrightness {
+        monitor: String,
+        percent: u8,
+    },
+    ToggleDisplay {
+        name: String,
+        enabled: bool,
+    },
     SetMonitorScale(String),
     SetTextSize(u8),
-    SetPowerProfile { profile: String, on_battery: bool },
+    SetPowerProfile {
+        profile: String,
+        on_battery: bool,
+    },
     SetNetworkBand(String),
     ToggleNightlight,
+    BluetoothDevice {
+        action: BluetoothDeviceAction,
+        address: String,
+    },
+    ConnectNetwork {
+        ssid: String,
+        device: String,
+    },
+    DisconnectNetwork(String),
+    ForgetNetwork(String),
+    RescanWifi(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BluetoothDeviceAction {
+    Pair,
+    Connect,
+    Disconnect,
+    Forget,
 }
 
 pub fn run_action(action: &SystemAction) -> Result<(), String> {
@@ -91,8 +119,8 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
         SystemAction::MediaNext => command("playerctl", &["-a", "next"]).map(|_| ()),
         SystemAction::MediaPrevious => command("playerctl", &["-a", "previous"]).map(|_| ()),
         SystemAction::SetBluetoothPower(powered) => command(
-            "bluetoothctl",
-            &["power", if *powered { "on" } else { "off" }],
+            "omarchy-bluetooth-power",
+            &[if *powered { "on" } else { "off" }],
         )
         .map(|_| ()),
         SystemAction::ActivateNetwork(connection) => {
@@ -146,6 +174,41 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             command("omarchy-network-band", &[band]).map(|_| ())
         }
         SystemAction::ToggleNightlight => command("omarchy-toggle-nightlight", &[]).map(|_| ()),
+        SystemAction::BluetoothDevice { action, address } => {
+            validate_bluetooth_address(address)?;
+            let command_name = match action {
+                BluetoothDeviceAction::Pair => "pair",
+                BluetoothDeviceAction::Connect => "connect",
+                BluetoothDeviceAction::Disconnect => "disconnect",
+                BluetoothDeviceAction::Forget => "forget",
+            };
+            command(
+                "omarchy-bluetooth-device",
+                &[command_name, address.as_str()],
+            )
+            .map(|_| ())
+        }
+        SystemAction::ConnectNetwork { ssid, device } => {
+            validate_argument(ssid, "network SSID")?;
+            validate_argument(device, "network device")?;
+            command(
+                "nmcli",
+                &["device", "wifi", "connect", ssid, "ifname", device],
+            )
+            .map(|_| ())
+        }
+        SystemAction::DisconnectNetwork(device) => {
+            validate_argument(device, "network device")?;
+            command("nmcli", &["device", "disconnect", device]).map(|_| ())
+        }
+        SystemAction::ForgetNetwork(connection) => {
+            validate_argument(connection, "network connection")?;
+            command("nmcli", &["connection", "delete", "id", connection]).map(|_| ())
+        }
+        SystemAction::RescanWifi(device) => {
+            validate_argument(device, "network device")?;
+            command("nmcli", &["device", "wifi", "rescan", "ifname", device]).map(|_| ())
+        }
     }
 }
 
@@ -1311,6 +1374,22 @@ fn validate_argument(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_bluetooth_address(address: &str) -> Result<(), String> {
+    let valid = address.len() == 17
+        && address.as_bytes().iter().enumerate().all(|(index, value)| {
+            if matches!(index, 2 | 5 | 8 | 11 | 14) {
+                *value == b':'
+            } else {
+                value.is_ascii_hexdigit()
+            }
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err("invalid Bluetooth address".to_string())
+    }
+}
+
 fn command_json(program: &str, args: &[&str]) -> Result<Value, String> {
     let raw = command(program, args)?;
     serde_json::from_str(&raw).map_err(|error| format!("{program} returned invalid JSON: {error}"))
@@ -1505,6 +1584,13 @@ mod tests {
         assert_eq!(
             run_action(&SystemAction::SetNetworkBand("10".to_string())),
             Err("invalid network band".to_string())
+        );
+        assert_eq!(
+            run_action(&SystemAction::BluetoothDevice {
+                action: super::BluetoothDeviceAction::Connect,
+                address: "not-an-address".to_string(),
+            }),
+            Err("invalid Bluetooth address".to_string())
         );
     }
 }
