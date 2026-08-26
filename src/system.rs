@@ -58,8 +58,11 @@ pub enum SystemAction {
     ToggleInputMute,
     SetOutputVolume(u8),
     MediaPlayPause,
+    MediaPlay,
+    MediaPause,
     MediaNext,
     MediaPrevious,
+    SetWifiEnabled(bool),
     SetBluetoothPower(bool),
     ActivateNetwork(String),
     SetBrightness {
@@ -116,8 +119,15 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &value]).map(|_| ())
         }
         SystemAction::MediaPlayPause => command("playerctl", &["-a", "play-pause"]).map(|_| ()),
+        SystemAction::MediaPlay => command("playerctl", &["-a", "play"]).map(|_| ()),
+        SystemAction::MediaPause => command("playerctl", &["-a", "pause"]).map(|_| ()),
         SystemAction::MediaNext => command("playerctl", &["-a", "next"]).map(|_| ()),
         SystemAction::MediaPrevious => command("playerctl", &["-a", "previous"]).map(|_| ()),
+        SystemAction::SetWifiEnabled(enabled) => command(
+            "nmcli",
+            &["radio", "wifi", if *enabled { "on" } else { "off" }],
+        )
+        .map(|_| ()),
         SystemAction::SetBluetoothPower(powered) => command(
             "omarchy-bluetooth-power",
             &[if *powered { "on" } else { "off" }],
@@ -255,6 +265,7 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
         },
         "network": {
             "available": snapshot.network.available,
+            "wifiEnabled": snapshot.network.wifi_enabled,
             "device": snapshot.network.device,
             "kind": snapshot.network.kind,
             "connection": snapshot.network.connection,
@@ -617,6 +628,7 @@ pub fn parse_wpctl_volume(raw: &str) -> AudioEndpoint {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NetworkState {
     pub available: bool,
+    pub wifi_enabled: Option<bool>,
     pub device: String,
     pub kind: String,
     pub connection: String,
@@ -657,6 +669,9 @@ impl NetworkState {
                 network.available = nmcli.available || network.available;
             }
         }
+        network.wifi_enabled = command("nmcli", &["radio", "wifi"])
+            .ok()
+            .and_then(|raw| parse_nmcli_radio_wifi(&raw));
         if let Ok(raw) = command("omarchy-network-band", &[]) {
             network.band = parse_network_band(&raw);
         }
@@ -681,6 +696,14 @@ impl NetworkState {
             network.wifi_networks = parse_nmcli_wifi_list(&raw);
         }
         network
+    }
+}
+
+pub fn parse_nmcli_radio_wifi(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "enabled" | "yes" | "on" | "true" => Some(true),
+        "disabled" | "no" | "off" | "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -1403,8 +1426,9 @@ mod tests {
         SystemAction, parse_battery_shell, parse_bluetooth_devices, parse_bluetooth_show,
         parse_hyprland, parse_monitor_state, parse_network_band, parse_network_status,
         parse_network_verbose, parse_nightlight_temperature, parse_nmcli_device_status,
-        parse_nmcli_wifi_list, parse_playerctl_metadata, parse_power_profiles, parse_system_stats,
-        parse_text_size, parse_upower_display, parse_wpctl_volume, run_action,
+        parse_nmcli_radio_wifi, parse_nmcli_wifi_list, parse_playerctl_metadata,
+        parse_power_profiles, parse_system_stats, parse_text_size, parse_upower_display,
+        parse_wpctl_volume, run_action,
     };
 
     #[test]
@@ -1481,6 +1505,13 @@ mod tests {
         assert_eq!(band.current, "5");
         assert_eq!(band.available, vec!["2.4", "5"]);
         assert_eq!(band.selected, "auto");
+    }
+
+    #[test]
+    fn parses_network_manager_wifi_radio_state() {
+        assert_eq!(parse_nmcli_radio_wifi("enabled\n"), Some(true));
+        assert_eq!(parse_nmcli_radio_wifi("disabled\n"), Some(false));
+        assert_eq!(parse_nmcli_radio_wifi("unknown\n"), None);
     }
 
     #[test]

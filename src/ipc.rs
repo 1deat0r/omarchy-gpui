@@ -554,6 +554,7 @@ fn dispatch_call(
         | ("omarchy.background", "refresh")
         | ("omarchy.indicators", "refresh")
         | ("omarchy.system-update", "refresh" | "clear")
+        | ("omarchy.menu", "refresh")
         | ("omarchy.clock", "refresh" | "cycleFormat" | "toggleWeekStart")
         | ("omarchy.dropbox", "refresh" | "login")
         | ("omarchy.tailscale", "refresh")
@@ -644,18 +645,12 @@ fn dispatch_call(
         }
         ("omarchy.network", "toggleNetwork") => {
             let snapshot = SystemSnapshot::collect();
-            if snapshot.network.device.is_empty() {
-                Ok(outcome("error", None))
-            } else {
-                let action = if snapshot.network.available {
-                    SystemAction::DisconnectNetwork(snapshot.network.device)
-                } else {
-                    SystemAction::ActivateNetwork(snapshot.network.connection)
-                };
-                match run_action(&action) {
-                    Ok(()) => Ok(outcome("ok", None)),
-                    Err(_) => Ok(outcome("error", None)),
-                }
+            let Some(enabled) = snapshot.network.wifi_enabled else {
+                return Ok(outcome("error", None));
+            };
+            match run_action(&SystemAction::SetWifiEnabled(!enabled)) {
+                Ok(()) => Ok(outcome("ok", None)),
+                Err(_) => Ok(outcome("error", None)),
             }
         }
         ("omarchy.network", "showQr") => Ok(outcome(
@@ -709,8 +704,8 @@ fn dispatch_call(
         ("omarchy.media", "playPause") => media_action(SystemAction::MediaPlayPause),
         ("omarchy.media", "next") => media_action(SystemAction::MediaNext),
         ("omarchy.media", "previous") => media_action(SystemAction::MediaPrevious),
-        ("omarchy.media", "play") => media_action(SystemAction::MediaPlayPause),
-        ("omarchy.media", "pause") => media_action(SystemAction::MediaPlayPause),
+        ("omarchy.media", "play") => media_action(SystemAction::MediaPlay),
+        ("omarchy.media", "pause") => media_action(SystemAction::MediaPause),
         (
             "omarchy.media",
             "sourceNext" | "sourcePrevious" | "sourceSwitch" | "sourceSwitchPrevious",
