@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+project_root=$(git rev-parse --show-toplevel)
+cd "$project_root"
+
+node scripts/update-docs.mjs
+git add -- README.md docs/STATUS.md
+node scripts/update-github-metadata.mjs
+git diff --cached --check
+
+echo "OMARCHY_GPUI_PRECOMMIT_OK"

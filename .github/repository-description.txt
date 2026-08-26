@@ -1,0 +1,1 @@
+Experimental Rust/GPUI port of the Omarchy shell with a parity-first workflow
