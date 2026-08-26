@@ -13,14 +13,14 @@ use std::{
 
 use serde_json::Value;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginSnapshot {
     pub agents: AgentState,
     pub update: UpdateState,
     pub keyboard: KeyboardLayoutState,
     pub weather: WeatherState,
     pub idle: IdleState,
-    pub dropbox: ServicePresence,
+    pub dropbox: DropboxState,
     pub tailscale: TailscaleState,
 }
 
@@ -32,7 +32,7 @@ impl PluginSnapshot {
             keyboard: KeyboardLayoutState::collect(),
             weather: WeatherState::collect(omarchy_path),
             idle: IdleState::collect(),
-            dropbox: ServicePresence::collect_dropbox(omarchy_path),
+            dropbox: DropboxState::collect_dropbox(omarchy_path),
             tailscale: TailscaleState::collect(),
         }
     }
@@ -295,29 +295,122 @@ impl IdleState {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ServicePresence {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DropboxState {
     pub installed: bool,
     pub running: bool,
+    pub authenticated: bool,
+    pub status_text: String,
+    pub account_path: String,
+    pub plan: String,
+    pub used_bytes: u64,
+    pub quota_bytes: u64,
+    pub usage_percent: f64,
+    pub quota_known: bool,
     pub error: Option<String>,
 }
 
-impl ServicePresence {
+impl DropboxState {
     fn collect_dropbox(omarchy_path: &Path) -> Self {
-        if !command_present("dropbox-cli") && !command_present("dropbox") {
-            return Self::default();
+        let helper = omarchy_path.join("shell/plugins/panels/dropbox/status.py");
+        if !helper.is_file() {
+            return Self {
+                status_text: "Unavailable".to_string(),
+                ..Self::default()
+            };
         }
-        match omarchy_command_with_status(omarchy_path, "omarchy-installed-service-dropbox", &[]) {
-            Ok((running, _)) => Self {
-                installed: true,
-                running,
-                error: None,
-            },
+        match Command::new("python3").arg(&helper).arg("25").output() {
+            Ok(output) if output.status.success() => {
+                parse_dropbox_status(&String::from_utf8_lossy(&output.stdout))
+            }
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Self {
+                    status_text: "Unavailable".to_string(),
+                    error: Some(if detail.is_empty() {
+                        format!("{} exited unsuccessfully", helper.display())
+                    } else {
+                        detail
+                    }),
+                    ..Self::default()
+                }
+            }
             Err(error) => Self {
-                error: Some(error),
+                status_text: "Unavailable".to_string(),
+                error: Some(format!("{}: {error}", helper.display())),
                 ..Self::default()
             },
         }
+    }
+}
+
+pub fn parse_dropbox_status(raw: &str) -> DropboxState {
+    let Ok(value) = serde_json::from_str::<Value>(raw.trim()) else {
+        return DropboxState {
+            status_text: "Unavailable".to_string(),
+            error: Some("Failed to parse Dropbox status".to_string()),
+            ..DropboxState::default()
+        };
+    };
+    let Some(object) = value.as_object() else {
+        return DropboxState {
+            status_text: "Unavailable".to_string(),
+            error: Some("Dropbox status was not an object".to_string()),
+            ..DropboxState::default()
+        };
+    };
+    let installed = object
+        .get("installed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status_text = object
+        .get("statusText")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if installed {
+            "Stopped"
+        } else {
+            "Not installed"
+        })
+        .to_string();
+    DropboxState {
+        installed,
+        running: object
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        authenticated: object
+            .get("authenticated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        status_text,
+        account_path: object
+            .get("accountPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        plan: object
+            .get("plan")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        used_bytes: object
+            .get("usedBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        quota_bytes: object
+            .get("quotaBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        usage_percent: object
+            .get("usagePercent")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        quota_known: object
+            .get("quotaKnown")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        error: None,
     }
 }
 
@@ -337,9 +430,10 @@ impl TailscaleState {
     fn collect() -> Self {
         match command_output("tailscale", &["status", "--json"]) {
             Ok(raw) => parse_tailscale_status(&raw),
-            Err(error) if error.contains("No such file") || error.contains("not found") => {
-                Self::default()
-            }
+            Err(error) if error.contains("No such file") || error.contains("not found") => Self {
+                status: "Not installed".to_string(),
+                ..Self::default()
+            },
             Err(error) => Self {
                 installed: true,
                 error: Some(error),
@@ -451,18 +545,11 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn command_present(program: &str) -> bool {
-    Command::new("which")
-        .arg(program)
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_default_agent, parse_keyboard_devices, parse_network_qr, parse_tailscale_status,
-        parse_update_status, parse_weather_status,
+        parse_default_agent, parse_dropbox_status, parse_keyboard_devices, parse_network_qr,
+        parse_tailscale_status, parse_update_status, parse_weather_status,
     };
 
     #[test]
@@ -502,5 +589,19 @@ mod tests {
         let (meta, rows) = parse_network_qr("meta\twlp6s0\tWPA\tSTARLINK\n0101\n1110\n");
         assert_eq!(meta, "Wi-Fi: STARLINK · WPA · wlp6s0");
         assert_eq!(rows, vec!["0101", "1110"]);
+    }
+
+    #[test]
+    fn dropbox_parser_preserves_status_and_quota_fields() {
+        let state = parse_dropbox_status(
+            r#"{"ok":true,"installed":true,"running":true,"authenticated":true,"statusText":"Up to date","accountPath":"/home/me/Dropbox","plan":"basic","usedBytes":1200,"quotaBytes":2000,"usagePercent":60,"quotaKnown":true}"#,
+        );
+        assert!(state.installed);
+        assert!(state.running);
+        assert!(state.authenticated);
+        assert_eq!(state.status_text, "Up to date");
+        assert_eq!(state.used_bytes, 1200);
+        assert_eq!(state.quota_bytes, 2000);
+        assert!(state.quota_known);
     }
 }

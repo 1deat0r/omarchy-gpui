@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::config::ShellSnapshot;
+use crate::plugins::{parse_dropbox_status, parse_tailscale_status};
 use crate::system::{SystemAction, SystemSnapshot, run_action};
 
 pub const IPC_METHODS: &[&str] = &[
@@ -666,10 +667,17 @@ fn dispatch_call(
         | ("omarchy.system-update", "refresh" | "clear")
         | ("omarchy.menu", "refresh")
         | ("omarchy.clock", "refresh" | "cycleFormat" | "toggleWeekStart")
-        | ("omarchy.dropbox", "refresh" | "login")
+        | ("omarchy.dropbox", "refresh")
         | ("omarchy.tailscale", "refresh")
         | ("omarchy.weather", "refresh")
         | ("omarchy.nightlight", "refresh") => Ok(outcome("ok", Some(IpcEvent::Refresh))),
+
+        ("omarchy.dropbox", "login") => {
+            if command_present("dropbox-cli") {
+                let _ = Command::new("dropbox-cli").arg("start").spawn();
+            }
+            Ok(outcome("ok", None))
+        }
 
         ("omarchy.background", "refresh") => {
             let home = home_from_config_path(&runtime.snapshot.user_config_path);
@@ -950,9 +958,26 @@ fn dispatch_call(
         ("omarchy.lock", "preview" | "hidePreview") => Ok(outcome("ok", None)),
         ("omarchy.lock", "lock") => Ok(outcome("failed", None)),
 
-        ("omarchy.dropbox", "status") => Ok(outcome("Unavailable", None)),
-        ("omarchy.tailscale", "status") => Ok(outcome("Unavailable", None)),
-        ("omarchy.tailscale", "toggleTailscale" | "up" | "down") => Ok(outcome("ok", None)),
+        ("omarchy.dropbox", "status") => Ok(outcome(
+            &live_dropbox_status(&runtime.snapshot.omarchy_path),
+            None,
+        )),
+        ("omarchy.tailscale", "status") => Ok(outcome(&live_tailscale_status(), None)),
+        ("omarchy.tailscale", "up" | "down" | "toggleTailscale") => {
+            let action = if method == "toggleTailscale" {
+                if live_tailscale_running() {
+                    "down"
+                } else {
+                    "up"
+                }
+            } else {
+                method
+            };
+            if command_present("tailscale") {
+                let _ = Command::new("tailscale").arg(action).spawn();
+            }
+            Ok(outcome("ok", None))
+        }
         ("omarchy.weather", "edit") => Ok(outcome(
             "ok",
             Some(IpcEvent::Summon {
@@ -1365,6 +1390,57 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn live_dropbox_status(omarchy_path: &Path) -> String {
+    let helper = omarchy_path.join("shell/plugins/panels/dropbox/status.py");
+    if !helper.is_file() {
+        return "Unavailable".to_string();
+    }
+    let output = match Command::new("python3").arg(&helper).arg("25").output() {
+        Ok(output) => output,
+        Err(_) => return "Unavailable".to_string(),
+    };
+    if !output.status.success() {
+        return "Unavailable".to_string();
+    }
+    let state = parse_dropbox_status(&String::from_utf8_lossy(&output.stdout));
+    if state.status_text.is_empty() {
+        "Unavailable".to_string()
+    } else {
+        state.status_text
+    }
+}
+
+fn live_tailscale_state() -> Option<crate::plugins::TailscaleState> {
+    let output = Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_tailscale_status(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn live_tailscale_status() -> String {
+    match live_tailscale_state() {
+        Some(state) if !state.status.is_empty() => state.status,
+        Some(_) => "Disconnected".to_string(),
+        None if command_present("tailscale") => "Unavailable".to_string(),
+        None => "Not installed".to_string(),
+    }
+}
+
+fn live_tailscale_running() -> bool {
+    live_tailscale_state().is_some_and(|state| state.running)
+}
+
+fn command_present(program: &str) -> bool {
+    Command::new("which")
+        .arg(program)
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn finish_done_file(path: &str) -> Result<(), String> {

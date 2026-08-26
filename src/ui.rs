@@ -2080,6 +2080,27 @@ fn panel_rows(
         "omarchy.dropbox" => vec![
             ("Installed".to_string(), yes_no(plugins.dropbox.installed)),
             ("Running".to_string(), yes_no(plugins.dropbox.running)),
+            (
+                "Authenticated".to_string(),
+                yes_no(plugins.dropbox.authenticated),
+            ),
+            (
+                "Status".to_string(),
+                display_or_dash(&plugins.dropbox.status_text),
+            ),
+            (
+                "Usage".to_string(),
+                if plugins.dropbox.quota_known {
+                    format!(
+                        "{}% ({}/{})",
+                        plugins.dropbox.usage_percent.round() as u64,
+                        plugins.dropbox.used_bytes,
+                        plugins.dropbox.quota_bytes
+                    )
+                } else {
+                    plugins.dropbox.used_bytes.to_string()
+                },
+            ),
         ],
         "omarchy.tailscale" => vec![
             ("Installed".to_string(), yes_no(plugins.tailscale.installed)),
