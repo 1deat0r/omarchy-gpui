@@ -1,6 +1,456 @@
 {
   "schemaVersion": 1,
   "reference": "/usr/share/omarchy/shell",
-  "plugins": {},
+  "referenceOmarchyVersion": "4.0.1-1",
+  "plugins": {
+    "omarchy.active-window": {
+      "referenceEntryPoints": {
+        "barWidget": "ActiveWindow.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/ActiveWindow.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.agents": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/agents/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.audio": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/audio/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.background": {
+      "referenceEntryPoints": {
+        "service": "Background.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/background/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.bar": {
+      "referenceEntryPoints": {
+        "bar": "Bar.qml"
+      },
+      "referenceKinds": [
+        "bar"
+      ],
+      "referenceManifest": "plugins/bar/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.battery": {
+      "referenceEntryPoints": {
+        "service": "Service.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/services/battery/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.bluetooth": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/bluetooth/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.clipboard": {
+      "referenceEntryPoints": {
+        "overlay": "Clipboard.qml"
+      },
+      "referenceKinds": [
+        "overlay"
+      ],
+      "referenceManifest": "plugins/clipboard/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.clock": {
+      "referenceEntryPoints": {
+        "barWidget": "BarWidget.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/clock/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.dev-gallery": {
+      "referenceEntryPoints": {
+        "panel": "GalleryPanel.qml"
+      },
+      "referenceKinds": [
+        "panel"
+      ],
+      "referenceManifest": "plugins/dev-gallery/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.disk-speedtest": {
+      "referenceEntryPoints": {
+        "panel": "Panel.qml"
+      },
+      "referenceKinds": [
+        "panel"
+      ],
+      "referenceManifest": "plugins/panels/disk-speedtest/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.dropbox": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/dropbox/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.emojis": {
+      "referenceEntryPoints": {
+        "overlay": "Emojis.qml"
+      },
+      "referenceKinds": [
+        "overlay"
+      ],
+      "referenceManifest": "plugins/emojis/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.idle": {
+      "referenceEntryPoints": {
+        "service": "Service.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/services/idle/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.image-picker": {
+      "referenceEntryPoints": {
+        "overlay": "ImagePicker.qml"
+      },
+      "referenceKinds": [
+        "overlay"
+      ],
+      "referenceManifest": "plugins/image-picker/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.indicators": {
+      "referenceEntryPoints": {
+        "barWidget": "Indicators.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/Indicators.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.keyboard-layout": {
+      "referenceEntryPoints": {
+        "barWidget": "KeyboardLayout.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/KeyboardLayout.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.lock": {
+      "referenceEntryPoints": {
+        "service": "Service.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/lock/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.media": {
+      "referenceEntryPoints": {
+        "service": "Service.qml",
+        "barWidget": "BarWidget.qml"
+      },
+      "referenceKinds": [
+        "service",
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/services/media/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.menu": {
+      "referenceEntryPoints": {
+        "menu": "Menu.qml",
+        "barWidget": "BarWidget.qml"
+      },
+      "referenceKinds": [
+        "menu",
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/menu/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.microphone": {
+      "referenceEntryPoints": {
+        "barWidget": "Microphone.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/Microphone.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.monitor": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/monitor/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.network": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/network/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.nightlight": {
+      "referenceEntryPoints": {
+        "service": "Service.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/services/nightlight/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.notifications": {
+      "referenceEntryPoints": {
+        "service": "Service.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/notifications/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.osd": {
+      "referenceEntryPoints": {
+        "panel": "Osd.qml"
+      },
+      "referenceKinds": [
+        "panel"
+      ],
+      "referenceManifest": "plugins/osd/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.polkit": {
+      "referenceEntryPoints": {
+        "service": "PolkitAgent.qml"
+      },
+      "referenceKinds": [
+        "service"
+      ],
+      "referenceManifest": "plugins/polkit/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.power": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/power/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.reminders": {
+      "referenceEntryPoints": {
+        "overlay": "ReminderFlow.qml"
+      },
+      "referenceKinds": [
+        "overlay"
+      ],
+      "referenceManifest": "plugins/reminders/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.spacer": {
+      "referenceEntryPoints": {
+        "barWidget": "Spacer.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/Spacer.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.speedtest": {
+      "referenceEntryPoints": {
+        "panel": "Panel.qml"
+      },
+      "referenceKinds": [
+        "panel"
+      ],
+      "referenceManifest": "plugins/panels/speedtest/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.system-update": {
+      "referenceEntryPoints": {
+        "barWidget": "SystemUpdate.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/SystemUpdate.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.tailscale": {
+      "referenceEntryPoints": {
+        "barWidget": "Panel.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/tailscale/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.tray": {
+      "referenceEntryPoints": {
+        "barWidget": "Tray.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/Tray.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.weather": {
+      "referenceEntryPoints": {
+        "barWidget": "BarWidget.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/panels/weather/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.wifiqr": {
+      "referenceEntryPoints": {
+        "panel": "Panel.qml"
+      },
+      "referenceKinds": [
+        "panel"
+      ],
+      "referenceManifest": "plugins/panels/wifiqr/manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    },
+    "omarchy.workspaces": {
+      "referenceEntryPoints": {
+        "barWidget": "Workspaces.qml"
+      },
+      "referenceKinds": [
+        "bar-widget"
+      ],
+      "referenceManifest": "plugins/bar/widgets/Workspaces.manifest.json",
+      "status": "pending",
+      "gpuiModule": null,
+      "evidence": []
+    }
+  },
   "verifiedFeatures": []
 }

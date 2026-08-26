@@ -128,10 +128,11 @@ fn run_shell(snapshot: ShellSnapshot, smoke: bool) {
         (px(8.0), px(12.0), px(0.0), px(12.0))
     };
 
-    let _ipc_server = ipc::IpcServer::start(snapshot.clone()).unwrap_or_else(|error| {
-        eprintln!("omarchy-gpui-shell: {error}");
-        std::process::exit(2);
-    });
+    let (_ipc_server, ipc_events) =
+        ipc::IpcServer::start(snapshot.clone()).unwrap_or_else(|error| {
+            eprintln!("omarchy-gpui-shell: {error}");
+            std::process::exit(2);
+        });
 
     application().run(move |cx: &mut App| {
         let window_options = WindowOptions {
@@ -173,7 +174,7 @@ fn run_shell(snapshot: ShellSnapshot, smoke: bool) {
                     })
                     .detach();
             }
-            cx.new(|cx| ui::ShellView::new(snapshot, smoke, cx))
+            cx.new(|cx| ui::ShellView::new(snapshot, smoke, ipc_events, cx))
         })
         .expect("open Omarchy GPUI layer-shell window");
 

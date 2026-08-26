@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -91,6 +92,16 @@ pub enum ShellCommand {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IpcEvent {
+    Refresh,
+    Summon { id: String, payload: String },
+    Hide { id: String },
+    Toggle { id: String, payload: String },
+}
+
+pub type IpcEventReceiver = Arc<Mutex<Receiver<IpcEvent>>>;
+
 /// A small JSON-lines Unix-socket bridge for the long-lived GPUI shell.
 ///
 /// Omarchy's installed helper talks to a running Quickshell process.  Keeping
@@ -105,7 +116,7 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    pub fn start(snapshot: ShellSnapshot) -> Result<Self, String> {
+    pub fn start(snapshot: ShellSnapshot) -> Result<(Self, IpcEventReceiver), String> {
         let path = socket_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("create IPC directory: {error}"))?;
@@ -132,12 +143,13 @@ impl IpcServer {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let state = Arc::new(Mutex::new(snapshot));
+        let (event_tx, event_rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("omarchy-gpui-ipc".to_string())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
-                        Ok((stream, _)) => handle_connection(stream, &state),
+                        Ok((stream, _)) => handle_connection(stream, &state, &event_tx),
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(25));
                         }
@@ -147,11 +159,14 @@ impl IpcServer {
             })
             .map_err(|error| format!("start IPC thread: {error}"))?;
 
-        Ok(Self {
-            path,
-            stop,
-            thread: Some(thread),
-        })
+        Ok((
+            Self {
+                path,
+                stop,
+                thread: Some(thread),
+            },
+            Arc::new(Mutex::new(event_rx)),
+        ))
     }
 }
 
@@ -216,17 +231,27 @@ pub fn try_call_running(args: &[String]) -> Result<Option<String>, String> {
 fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
     state: &Arc<Mutex<ShellSnapshot>>,
+    events: &Sender<IpcEvent>,
 ) {
     let mut raw = String::new();
-    let response = match stream.read_to_string(&mut raw) {
+    let (response, event) = match stream.read_to_string(&mut raw) {
         Ok(_) => handle_request(raw.trim(), state),
-        Err(error) => serde_json::json!({"ok": false, "error": format!("read request: {error}")}),
+        Err(error) => (
+            serde_json::json!({"ok": false, "error": format!("read request: {error}")}),
+            None,
+        ),
     };
+    if let Some(event) = event {
+        let _ = events.send(event);
+    }
     let _ = stream.write_all(response.to_string().as_bytes());
     let _ = stream.write_all(b"\n");
 }
 
-fn handle_request(raw: &str, state: &Arc<Mutex<ShellSnapshot>>) -> serde_json::Value {
+fn handle_request(
+    raw: &str,
+    state: &Arc<Mutex<ShellSnapshot>>,
+) -> (serde_json::Value, Option<IpcEvent>) {
     let args = match serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .and_then(|value| value.get("args").cloned())
@@ -238,18 +263,46 @@ fn handle_request(raw: &str, state: &Arc<Mutex<ShellSnapshot>>) -> serde_json::V
                 .collect::<Option<Vec<_>>>()
         }) {
         Some(args) => args,
-        None => return serde_json::json!({"ok": false, "error": "invalid IPC request"}),
+        None => {
+            return (
+                serde_json::json!({"ok": false, "error": "invalid IPC request"}),
+                None,
+            );
+        }
     };
 
+    let parsed = parse(&args);
+    let event = parsed.as_ref().ok().and_then(event_for_command);
     let result = state
         .lock()
         .map_err(|_| "IPC state lock poisoned".to_string())
-        .and_then(|mut snapshot| {
-            parse(&args).and_then(|command| dispatch(&command, &mut snapshot))
-        });
+        .and_then(|mut snapshot| parsed.and_then(|command| dispatch(&command, &mut snapshot)));
     match result {
-        Ok(output) => serde_json::json!({"ok": true, "output": output}),
-        Err(error) => serde_json::json!({"ok": false, "error": error}),
+        Ok(output) => (serde_json::json!({"ok": true, "output": output}), event),
+        Err(error) => (serde_json::json!({"ok": false, "error": error}), None),
+    }
+}
+
+fn event_for_command(command: &ShellCommand) -> Option<IpcEvent> {
+    match command {
+        ShellCommand::ReloadConfig
+        | ShellCommand::RescanPlugins
+        | ShellCommand::ToggleBarTransparency
+        | ShellCommand::EnablePlugin { .. }
+        | ShellCommand::PutBarWidget { .. }
+        | ShellCommand::MoveBarWidget { .. }
+        | ShellCommand::SetBarWidget { .. }
+        | ShellCommand::SetPluginEnabled { .. } => Some(IpcEvent::Refresh),
+        ShellCommand::Summon { id, payload } => Some(IpcEvent::Summon {
+            id: id.clone(),
+            payload: payload.clone(),
+        }),
+        ShellCommand::Hide { id } => Some(IpcEvent::Hide { id: id.clone() }),
+        ShellCommand::Toggle { id, payload } => Some(IpcEvent::Toggle {
+            id: id.clone(),
+            payload: payload.clone(),
+        }),
+        _ => None,
     }
 }
 
