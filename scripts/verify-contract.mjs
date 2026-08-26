@@ -8,8 +8,11 @@ const requiredFiles = [
   "assets/default-shell.json",
   "src/config.rs",
   "src/ipc.rs",
+  "src/menu.rs",
   "src/main.rs",
+  "src/system.rs",
   "src/ui.rs",
+  "bin/omarchy-shell",
 ];
 
 for (const relative of requiredFiles) {

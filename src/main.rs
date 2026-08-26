@@ -67,6 +67,7 @@ fn print_help() {
     println!(
         "omarchy-gpui-shell\n\nUsage:\n  omarchy-gpui-shell                 run the GPUI layer-shell bar\n  omarchy-gpui-shell --smoke          render one Wayland frame and exit\n  omarchy-gpui-shell --print-contract print resolved Omarchy paths and contract\n  omarchy-gpui-shell --print-system   print live compositor and service state\n  omarchy-gpui-shell shell ping        run a shell IPC-compatible health command\n  omarchy-gpui-shell shell listPlugins list configured shell entries\n"
     );
+    println!("  omarchy-gpui-shell --print-menu     parse the native Omarchy JSONC menu");
 }
 
 fn print_system() {
