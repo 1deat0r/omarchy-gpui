@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     net::Shutdown,
@@ -102,6 +103,27 @@ pub enum IpcEvent {
 
 pub type IpcEventReceiver = Arc<Mutex<Receiver<IpcEvent>>>;
 
+struct IpcRuntime {
+    snapshot: ShellSnapshot,
+    open_panel_ids: BTreeSet<String>,
+    pending_payloads: BTreeMap<String, Vec<String>>,
+}
+
+impl IpcRuntime {
+    fn new(snapshot: ShellSnapshot) -> Self {
+        Self {
+            snapshot,
+            open_panel_ids: BTreeSet::new(),
+            pending_payloads: BTreeMap::new(),
+        }
+    }
+}
+
+struct CommandOutcome {
+    output: String,
+    event: Option<IpcEvent>,
+}
+
 /// A small JSON-lines Unix-socket bridge for the long-lived GPUI shell.
 ///
 /// Omarchy's installed helper talks to a running Quickshell process.  Keeping
@@ -142,7 +164,7 @@ impl IpcServer {
             .map_err(|error| format!("configure IPC socket: {error}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let state = Arc::new(Mutex::new(snapshot));
+        let state = Arc::new(Mutex::new(IpcRuntime::new(snapshot)));
         let (event_tx, event_rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("omarchy-gpui-ipc".to_string())
@@ -230,7 +252,7 @@ pub fn try_call_running(args: &[String]) -> Result<Option<String>, String> {
 
 fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
-    state: &Arc<Mutex<ShellSnapshot>>,
+    state: &Arc<Mutex<IpcRuntime>>,
     events: &Sender<IpcEvent>,
 ) {
     let mut raw = String::new();
@@ -250,7 +272,7 @@ fn handle_connection(
 
 fn handle_request(
     raw: &str,
-    state: &Arc<Mutex<ShellSnapshot>>,
+    state: &Arc<Mutex<IpcRuntime>>,
 ) -> (serde_json::Value, Option<IpcEvent>) {
     let args = match serde_json::from_str::<serde_json::Value>(raw)
         .ok()
@@ -271,38 +293,19 @@ fn handle_request(
         }
     };
 
-    let parsed = parse(&args);
-    let event = parsed.as_ref().ok().and_then(event_for_command);
     let result = state
         .lock()
         .map_err(|_| "IPC state lock poisoned".to_string())
-        .and_then(|mut snapshot| parsed.and_then(|command| dispatch(&command, &mut snapshot)));
+        .and_then(|mut runtime| {
+            let command = parse(&args)?;
+            dispatch_runtime(&command, &mut runtime)
+        });
     match result {
-        Ok(output) => (serde_json::json!({"ok": true, "output": output}), event),
+        Ok(outcome) => (
+            serde_json::json!({"ok": true, "output": outcome.output}),
+            outcome.event,
+        ),
         Err(error) => (serde_json::json!({"ok": false, "error": error}), None),
-    }
-}
-
-fn event_for_command(command: &ShellCommand) -> Option<IpcEvent> {
-    match command {
-        ShellCommand::ReloadConfig
-        | ShellCommand::RescanPlugins
-        | ShellCommand::ToggleBarTransparency
-        | ShellCommand::EnablePlugin { .. }
-        | ShellCommand::PutBarWidget { .. }
-        | ShellCommand::MoveBarWidget { .. }
-        | ShellCommand::SetBarWidget { .. }
-        | ShellCommand::SetPluginEnabled { .. } => Some(IpcEvent::Refresh),
-        ShellCommand::Summon { id, payload } => Some(IpcEvent::Summon {
-            id: id.clone(),
-            payload: payload.clone(),
-        }),
-        ShellCommand::Hide { id } => Some(IpcEvent::Hide { id: id.clone() }),
-        ShellCommand::Toggle { id, payload } => Some(IpcEvent::Toggle {
-            id: id.clone(),
-            payload: payload.clone(),
-        }),
-        _ => None,
     }
 }
 
@@ -381,8 +384,19 @@ pub fn parse(args: &[String]) -> Result<ShellCommand, String> {
 }
 
 pub fn dispatch(command: &ShellCommand, snapshot: &mut ShellSnapshot) -> Result<String, String> {
+    let mut runtime = IpcRuntime::new(snapshot.clone());
+    let outcome = dispatch_runtime(command, &mut runtime)?;
+    *snapshot = runtime.snapshot;
+    Ok(outcome.output)
+}
+
+fn dispatch_runtime(
+    command: &ShellCommand,
+    runtime: &mut IpcRuntime,
+) -> Result<CommandOutcome, String> {
+    let snapshot = &mut runtime.snapshot;
     match command {
-        ShellCommand::Ping => Ok("ok".to_string()),
+        ShellCommand::Ping => Ok(outcome("ok", None)),
         ShellCommand::ApplyTheme { colors, shell } => {
             // GPUI theme application is process-local for now. Decode both
             // payloads here so malformed base64 follows the same fail-open
@@ -390,41 +404,45 @@ pub fn dispatch(command: &ShellCommand, snapshot: &mut ShellSnapshot) -> Result<
             // wired into the renderer.
             let _ = decode_base64(colors);
             let _ = decode_base64(shell);
-            Ok("ok".to_string())
+            Ok(outcome("ok", None))
         }
-        ShellCommand::ReloadConfig | ShellCommand::RescanPlugins => {
+        ShellCommand::ReloadConfig => {
             snapshot.reload();
-            Ok("ok".to_string())
+            Ok(outcome("ok", Some(IpcEvent::Refresh)))
+        }
+        ShellCommand::RescanPlugins => {
+            snapshot.reload();
+            Ok(outcome("", Some(IpcEvent::Refresh)))
         }
         ShellCommand::ToggleBarTransparency => {
             snapshot.toggle_bar_transparency()?;
-            Ok("ok".to_string())
+            Ok(outcome("ok", Some(IpcEvent::Refresh)))
         }
         ShellCommand::EnablePlugin { id, placement } => {
             let placement = parse_json_object(placement, "placement")?;
             if snapshot.set_plugin_enabled(id, true, Some(&placement))? {
-                Ok("ok".to_string())
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
             } else {
-                Ok("unknown".to_string())
+                Ok(outcome("unknown", None))
             }
         }
         ShellCommand::PutBarWidget { id, placement } => {
             let placement = parse_json_object(placement, "placement")?;
             let error = snapshot.put_bar_widget(id, Some(&placement))?;
-            Ok(if error.is_empty() {
-                "ok".to_string()
+            if error.is_empty() {
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
             } else {
-                error
-            })
+                Ok(outcome(&error, None))
+            }
         }
         ShellCommand::MoveBarWidget { id, placement } => {
             let placement = parse_json_object(placement, "placement")?;
             let error = snapshot.move_bar_widget(id, &placement)?;
-            Ok(if error.is_empty() {
-                "ok".to_string()
+            if error.is_empty() {
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
             } else {
-                error
-            })
+                Ok(outcome(&error, None))
+            }
         }
         ShellCommand::SetBarWidget {
             id,
@@ -436,48 +454,143 @@ pub fn dispatch(command: &ShellCommand, snapshot: &mut ShellSnapshot) -> Result<
                 .map_err(|error| format!("invalid widget setting: {error}"))?;
             let selector = parse_json_object(selector, "selector")?;
             let error = snapshot.set_bar_widget(id, key, value, Some(&selector))?;
-            Ok(if error.is_empty() {
-                "ok".to_string()
+            if error.is_empty() {
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
             } else {
-                error
-            })
+                Ok(outcome(&error, None))
+            }
         }
-        ShellCommand::ListPlugins => Ok(plugin_list(snapshot)),
-        ShellCommand::ListShellConfig => Ok(snapshot.config.to_string()),
-        ShellCommand::DebugBarGeometry => Ok("[]".to_string()),
+        ShellCommand::ListPlugins => Ok(outcome(&plugin_list(snapshot), None)),
+        ShellCommand::ListShellConfig => Ok(outcome(&snapshot.config.to_string(), None)),
+        ShellCommand::DebugBarGeometry => Ok(outcome("[]", None)),
         ShellCommand::TogglePanelAt { section, index } => {
-            let Some(index) = index.parse::<usize>().ok() else {
-                return Ok("unknown".to_string());
+            let Some(id) = panel_widget_id_at(snapshot, section, index) else {
+                return Ok(outcome("unknown", None));
             };
-            let entries = match section.as_str() {
-                "left" => &snapshot.left,
-                "center" => &snapshot.center,
-                "right" => &snapshot.right,
-                _ => return Ok("unknown".to_string()),
-            };
-            Ok(entries
-                .get(index)
-                .map(|entry| entry.id.clone())
-                .unwrap_or_else(|| "unknown".to_string()))
+            let event = toggle_panel(runtime, &id, "{}").map(|_| IpcEvent::Toggle {
+                id: id.clone(),
+                payload: "{}".to_string(),
+            });
+            Ok(outcome(&id, event))
         }
-        ShellCommand::Call { .. } => Ok("unknown".to_string()),
-        ShellCommand::Summon { id, .. }
-        | ShellCommand::Hide { id }
-        | ShellCommand::Toggle { id, .. } => {
-            if snapshot.plugin(id).is_some() {
-                Ok("ok".to_string())
+        ShellCommand::Call { .. } => Ok(outcome("unknown", None)),
+        ShellCommand::Summon { id, payload } => {
+            let Some(resolved) = summon_panel(runtime, id, payload) else {
+                return Ok(outcome("unknown", None));
+            };
+            Ok(outcome(
+                "ok",
+                Some(IpcEvent::Summon {
+                    id: resolved,
+                    payload: payload.clone(),
+                }),
+            ))
+        }
+        ShellCommand::Hide { id } => {
+            let resolved = resolve_enabled_id(snapshot, id);
+            let removed = runtime.open_panel_ids.remove(&resolved);
+            if removed || snapshot.plugin(&resolved).is_some() {
+                Ok(outcome("", Some(IpcEvent::Hide { id: resolved })))
             } else {
-                Ok("unknown".to_string())
+                Ok(outcome("", None))
+            }
+        }
+        ShellCommand::Toggle { id, payload } => {
+            let resolved = resolve_enabled_id(snapshot, id);
+            if runtime.open_panel_ids.remove(&resolved) {
+                Ok(outcome("", Some(IpcEvent::Hide { id: resolved })))
+            } else {
+                let Some(resolved) = summon_panel(runtime, &resolved, payload) else {
+                    return Ok(outcome("", None));
+                };
+                Ok(outcome(
+                    "",
+                    Some(IpcEvent::Toggle {
+                        id: resolved,
+                        payload: payload.clone(),
+                    }),
+                ))
             }
         }
         ShellCommand::SetPluginEnabled { id, enabled } => {
             if snapshot.set_plugin_enabled(id, *enabled, None)? {
-                Ok("ok".to_string())
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
             } else {
-                Ok("unknown".to_string())
+                Ok(outcome("unknown", None))
             }
         }
     }
+}
+
+fn outcome(output: &str, event: Option<IpcEvent>) -> CommandOutcome {
+    CommandOutcome {
+        output: output.to_string(),
+        event,
+    }
+}
+
+fn resolve_enabled_id(snapshot: &ShellSnapshot, requested: &str) -> String {
+    let key = requested.to_string();
+    snapshot
+        .plugins
+        .iter()
+        .filter(|plugin| {
+            plugin
+                .raw
+                .get("omarchy")
+                .and_then(|metadata| metadata.get("clonedFrom"))
+                .and_then(serde_json::Value::as_str)
+                == Some(key.as_str())
+                && snapshot.plugin_is_enabled(&plugin.id)
+        })
+        .map(|plugin| plugin.id.clone())
+        .min()
+        .unwrap_or(key)
+}
+
+fn summon_panel(runtime: &mut IpcRuntime, requested: &str, payload: &str) -> Option<String> {
+    let resolved = resolve_enabled_id(&runtime.snapshot, requested);
+    let plugin = runtime.snapshot.plugin(&resolved)?;
+    if !runtime.snapshot.plugin_is_enabled(&resolved) {
+        return None;
+    }
+    runtime.open_panel_ids.insert(resolved.clone());
+    runtime
+        .pending_payloads
+        .entry(resolved.clone())
+        .or_default()
+        .push(payload.to_string());
+    let _ = plugin;
+    Some(resolved)
+}
+
+fn toggle_panel(runtime: &mut IpcRuntime, id: &str, payload: &str) -> Option<bool> {
+    if runtime.open_panel_ids.remove(id) {
+        return Some(false);
+    }
+    summon_panel(runtime, id, payload).map(|_| true)
+}
+
+fn panel_widget_id_at(snapshot: &ShellSnapshot, section: &str, index: &str) -> Option<String> {
+    let requested = index.parse::<f64>().ok()?.round();
+    if requested < 1.0 || !requested.is_finite() {
+        return None;
+    }
+    let entries = match section {
+        "left" => &snapshot.left,
+        "center" => &snapshot.center,
+        "right" => &snapshot.right,
+        _ => return None,
+    };
+    entries
+        .iter()
+        .filter(|entry| {
+            snapshot
+                .plugin(&entry.id)
+                .is_some_and(|plugin| plugin.entry_points.contains_key("barWidget"))
+        })
+        .nth((requested as usize).saturating_sub(1))
+        .map(|entry| entry.id.clone())
 }
 
 fn plugin_list(snapshot: &ShellSnapshot) -> String {
@@ -566,7 +679,10 @@ fn required(args: &[String], index: usize, label: &str) -> Result<String, String
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellCommand, parse};
+    use std::{fs, path::PathBuf};
+
+    use super::{IpcEvent, IpcRuntime, ShellCommand, dispatch_runtime, parse};
+    use crate::config::ShellSnapshot;
 
     #[test]
     fn parses_omarchy_shell_commands() {
@@ -590,6 +706,82 @@ mod tests {
     #[test]
     fn rejects_unknown_methods() {
         assert!(parse(&args(&["shell", "nope"])).is_err());
+    }
+
+    #[test]
+    fn void_methods_and_panel_index_follow_reference_contract() {
+        let (root, snapshot) = fixture();
+        let mut runtime = IpcRuntime::new(snapshot);
+
+        let rescan = parse(&args(&["shell", "rescanPlugins"])).unwrap();
+        let result = dispatch_runtime(&rescan, &mut runtime).unwrap();
+        assert_eq!(result.output, "");
+        assert_eq!(result.event, Some(IpcEvent::Refresh));
+
+        let toggle_at = parse(&args(&["shell", "togglePanelAt", "left", "1"])).unwrap();
+        let result = dispatch_runtime(&toggle_at, &mut runtime).unwrap();
+        assert_eq!(result.output, "omarchy.audio");
+        assert_eq!(
+            result.event,
+            Some(IpcEvent::Toggle {
+                id: "omarchy.audio".to_string(),
+                payload: "{}".to_string(),
+            })
+        );
+
+        let zero_index = parse(&args(&["shell", "togglePanelAt", "left", "0"])).unwrap();
+        assert_eq!(
+            dispatch_runtime(&zero_index, &mut runtime).unwrap().output,
+            "unknown"
+        );
+
+        let hide = parse(&args(&["shell", "hide", "omarchy.audio"])).unwrap();
+        assert_eq!(dispatch_runtime(&hide, &mut runtime).unwrap().output, "");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summon_rejects_unknown_plugins_without_emitting_an_event() {
+        let (root, snapshot) = fixture();
+        let mut runtime = IpcRuntime::new(snapshot);
+        let summon = parse(&args(&["shell", "summon", "missing.plugin"])).unwrap();
+        let result = dispatch_runtime(&summon, &mut runtime).unwrap();
+        assert_eq!(result.output, "unknown");
+        assert_eq!(result.event, None);
+        assert!(runtime.open_panel_ids.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn fixture() -> (PathBuf, ShellSnapshot) {
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-gpui-ipc-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let omarchy = root.join("omarchy");
+        let home = root.join("home");
+        fs::create_dir_all(omarchy.join("config/omarchy")).expect("create config fixture");
+        fs::write(
+            omarchy.join("config/omarchy/shell.json"),
+            r#"{"version":1,"bar":{"layout":{"left":[{"id":"omarchy.audio"}],"center":[{"id":"omarchy.clock"}],"right":[{"id":"omarchy.tray"}]}},"plugins":[]}"#,
+        )
+        .expect("write config fixture");
+        for (id, name) in [("omarchy.audio", "Audio"), ("omarchy.clock", "Clock")] {
+            let directory = omarchy.join(format!("shell/plugins/{id}"));
+            fs::create_dir_all(&directory).expect("create plugin fixture");
+            fs::write(
+                directory.join("manifest.json"),
+                format!(
+                    r#"{{"schemaVersion":1,"id":"{id}","name":"{name}","version":"1.0.0","kinds":["bar-widget"],"entryPoints":{{"barWidget":"Panel.qml"}}}}"#
+                ),
+            )
+            .expect("write plugin fixture");
+        }
+        (
+            root.clone(),
+            ShellSnapshot::load_from_paths(&omarchy, &home),
+        )
     }
 
     fn args(values: &[&str]) -> Vec<String> {

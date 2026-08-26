@@ -41,7 +41,8 @@ fn main() {
                 }
                 let mut snapshot = snapshot;
                 match ipc::dispatch(&command, &mut snapshot) {
-                    Ok(response) => println!("{response}"),
+                    Ok(response) if !response.is_empty() => println!("{response}"),
+                    Ok(_) => {}
                     Err(error) => {
                         eprintln!("omarchy-gpui-shell: {error}");
                         std::process::exit(2);
