@@ -487,10 +487,18 @@ fn bar_location(config: &Value, id: &str) -> Option<(String, usize)> {
     None
 }
 
-fn selected_bar_location(config: &Value, id: &str, selector: Option<&Value>) -> Option<(String, usize)> {
+fn selected_bar_location(
+    config: &Value,
+    id: &str,
+    selector: Option<&Value>,
+) -> Option<(String, usize)> {
     let selector = selector.and_then(Value::as_object);
     let section = selector
-        .and_then(|selector| selector.get("fromSection").or_else(|| selector.get("section")))
+        .and_then(|selector| {
+            selector
+                .get("fromSection")
+                .or_else(|| selector.get("section"))
+        })
         .and_then(Value::as_str);
     let index = selector
         .and_then(|selector| selector.get("fromIndex").or_else(|| selector.get("index")))
@@ -507,7 +515,7 @@ fn selected_bar_location(config: &Value, id: &str, selector: Option<&Value>) -> 
             .and_then(Value::as_array)?;
         return (index < entries.len()
             && entries[index].get("id").and_then(Value::as_str) == Some(id))
-            .then(|| (section.to_string(), index));
+        .then(|| (section.to_string(), index));
     }
     bar_location(config, id)
 }
@@ -541,9 +549,7 @@ fn remove_bar_entry(config: &mut Value, id: &str) {
 }
 
 fn remove_plugin_entry(config: &mut Value, id: &str) {
-    if let Some(plugins) = config
-        .get_mut("plugins")
-        .and_then(Value::as_array_mut)
+    if let Some(plugins) = config.get_mut("plugins").and_then(Value::as_array_mut)
         && let Some(index) = plugins
             .iter()
             .position(|plugin| plugin.get("id").and_then(Value::as_str) == Some(id))
@@ -606,7 +612,9 @@ fn insert_bar_entry(
             .and_then(Value::as_str)
             .is_some_and(|requested| requested != relative_section)
         {
-            return Err(format!("target widget {relative_id} is not in section {section}"));
+            return Err(format!(
+                "target widget {relative_id} is not in section {section}"
+            ));
         }
         relative_index
             + usize::from(
@@ -932,6 +940,52 @@ mod tests {
             PluginSource::User
         );
         assert!(snapshot.plugin("omarchy.fake").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_mutations_are_atomic_and_reload_the_snapshot() {
+        let root = test_root("mutation");
+        let omarchy = root.join("omarchy");
+        let home = root.join("home");
+        let manifest_dir = omarchy.join("shell/plugins/panels/audio");
+        fs::create_dir_all(&manifest_dir).expect("create manifest fixture");
+        fs::create_dir_all(omarchy.join("config/omarchy")).expect("create defaults fixture");
+        fs::write(
+            omarchy.join("config/omarchy/shell.json"),
+            r#"{"version":1,"bar":{"position":"top","layout":{"left":[],"center":[],"right":[]}},"plugins":[]}"#,
+        )
+        .expect("write defaults fixture");
+        fs::write(
+            manifest_dir.join("manifest.json"),
+            r#"{
+              "schemaVersion": 1,
+              "id": "omarchy.audio",
+              "name": "Audio",
+              "version": "1.0.0",
+              "kinds": ["bar-widget"],
+              "entryPoints": {"barWidget": "Panel.qml"}
+            }"#,
+        )
+        .expect("write manifest fixture");
+
+        let mut snapshot = ShellSnapshot::load_from_paths(&omarchy, &home);
+        assert!(
+            snapshot
+                .set_plugin_enabled("omarchy.audio", true, None)
+                .unwrap()
+        );
+        assert_eq!(snapshot.center[0].id, "omarchy.audio");
+        assert!(snapshot.user_config_path.is_file());
+        assert!(snapshot.toggle_bar_transparency().is_ok());
+        assert!(snapshot.transparent);
+        assert!(
+            snapshot
+                .set_plugin_enabled("omarchy.audio", false, None)
+                .unwrap()
+        );
+        assert!(snapshot.center.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

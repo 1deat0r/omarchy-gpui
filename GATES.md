@@ -34,10 +34,10 @@ Scope: deliver a complete, behaviorally verified Rust/GPUI replacement for the O
   EXPECT: OMARCHY_GPUI_PARITY_AUDIT_OK
   EVIDENCE: pending
 
-- [ ] G8: the GPUI plugin registry discovers and validates every built-in and user plugin manifest with reference precedence
+- [x] G8: the GPUI plugin registry discovers and validates every built-in and user plugin manifest with reference precedence
   CHECK: PATH=/home/mustbearnold/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH /home/mustbearnold/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --offline plugin_registry && printf 'OMARCHY_GPUI_PLUGIN_REGISTRY_OK\n'
   EXPECT: OMARCHY_GPUI_PLUGIN_REGISTRY_OK
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=/run/media/mustbearnold/Projects/Operating_Systems/Omarchy-GPUI; path=a29e3b47b6f6/22 entries; output=Finished `test` profile [optimized + debuginfo] target(s) in 0.25s | Running unittests src/main.rs (target/debug/deps/omarchy_gpui_shell-02e80364b5e13ace)
 
 - [ ] G9: shell and plugin IPC behavior matches the reference target/method matrix, including state-changing side effects
   CHECK: node scripts/test-ipc-parity.mjs

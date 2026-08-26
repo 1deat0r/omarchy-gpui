@@ -21,7 +21,16 @@ fn main() {
         Some("--print-contract") => print_contract(&snapshot),
         Some("--smoke") => run_shell(snapshot, true),
         Some("shell") => match ipc::parse(&args) {
-            Ok(command) => println!("{}", ipc::response(&command, &snapshot)),
+            Ok(command) => {
+                let mut snapshot = snapshot;
+                match ipc::dispatch(&command, &mut snapshot) {
+                    Ok(response) => println!("{response}"),
+                    Err(error) => {
+                        eprintln!("omarchy-gpui-shell: {error}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             Err(error) => {
                 eprintln!("omarchy-gpui-shell: {error}");
                 std::process::exit(2);
