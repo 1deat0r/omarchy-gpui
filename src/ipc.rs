@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::config::ShellSnapshot;
+use crate::system::{SystemAction, SystemSnapshot, run_action};
 
 pub const IPC_METHODS: &[&str] = &[
     "ping",
@@ -107,6 +108,9 @@ struct IpcRuntime {
     snapshot: ShellSnapshot,
     open_panel_ids: BTreeSet<String>,
     pending_payloads: BTreeMap<String, Vec<String>>,
+    dnd_enabled: bool,
+    idle_enabled: bool,
+    osd_open: bool,
 }
 
 impl IpcRuntime {
@@ -115,6 +119,9 @@ impl IpcRuntime {
             snapshot,
             open_panel_ids: BTreeSet::new(),
             pending_payloads: BTreeMap::new(),
+            dnd_enabled: false,
+            idle_enabled: true,
+            osd_open: false,
         }
     }
 }
@@ -473,7 +480,7 @@ fn dispatch_runtime(
             });
             Ok(outcome(&id, event))
         }
-        ShellCommand::Call { .. } => Ok(outcome("unknown", None)),
+        ShellCommand::Call { id, method, arg } => dispatch_call(runtime, id, method, arg),
         ShellCommand::Summon { id, payload } => {
             let Some(resolved) = summon_panel(runtime, id, payload) else {
                 return Ok(outcome("unknown", None));
@@ -520,6 +527,535 @@ fn dispatch_runtime(
             }
         }
     }
+}
+
+fn dispatch_call(
+    runtime: &mut IpcRuntime,
+    requested_id: &str,
+    method: &str,
+    arg: &str,
+) -> Result<CommandOutcome, String> {
+    let Some(id) = resolve_call_target(&runtime.snapshot, requested_id) else {
+        return Ok(outcome("unknown", None));
+    };
+    if !runtime.snapshot.plugin_is_enabled(&id)
+        || !call_target_is_loaded(runtime, &id)
+        || !call_method_supported(&id, method)
+    {
+        return Ok(outcome("unknown", None));
+    }
+
+    if matches!(method, "open" | "show" | "close" | "hide" | "toggle") {
+        return Ok(dispatch_call_lifecycle(runtime, &id, method, arg));
+    }
+
+    let result = match (id.as_str(), method) {
+        ("omarchy.agents", "refresh" | "next")
+        | ("omarchy.background", "refresh")
+        | ("omarchy.indicators", "refresh")
+        | ("omarchy.system-update", "refresh" | "clear")
+        | ("omarchy.clock", "refresh" | "cycleFormat" | "toggleWeekStart")
+        | ("omarchy.dropbox", "refresh" | "login")
+        | ("omarchy.tailscale", "refresh")
+        | ("omarchy.weather", "refresh")
+        | ("omarchy.nightlight", "refresh") => Ok(outcome("ok", Some(IpcEvent::Refresh))),
+
+        ("omarchy.notifications", "dndState" | "isDnd") => Ok(outcome(
+            if runtime.dnd_enabled { "on" } else { "off" },
+            None,
+        )),
+        ("omarchy.notifications", "toggleDnd") => {
+            runtime.dnd_enabled = !runtime.dnd_enabled;
+            Ok(outcome(
+                if runtime.dnd_enabled { "on" } else { "off" },
+                None,
+            ))
+        }
+        ("omarchy.notifications", "setDnd") => {
+            runtime.dnd_enabled = parse_bool_arg(arg);
+            Ok(outcome(
+                if runtime.dnd_enabled { "on" } else { "off" },
+                None,
+            ))
+        }
+        ("omarchy.notifications", "clear" | "dismissAll") => Ok(outcome("ok", None)),
+        ("omarchy.notifications", "dismissOne" | "invokeLast" | "dismiss" | "showHistory") => {
+            Ok(outcome("none", None))
+        }
+        ("omarchy.notifications", "ping") => Ok(outcome("ok", None)),
+
+        ("omarchy.osd", "show") => {
+            runtime.osd_open = true;
+            Ok(outcome(
+                "ok",
+                Some(IpcEvent::Summon {
+                    id: id.clone(),
+                    payload: arg.to_string(),
+                }),
+            ))
+        }
+        ("omarchy.osd", "close") => {
+            runtime.osd_open = false;
+            runtime.open_panel_ids.remove(&id);
+            Ok(outcome("ok", Some(IpcEvent::Hide { id: id.clone() })))
+        }
+        ("omarchy.osd", "state") => Ok(outcome(
+            if runtime.osd_open { "open" } else { "closed" },
+            None,
+        )),
+        ("omarchy.osd", "ping") => Ok(outcome("ok", None)),
+
+        ("omarchy.monitor", "brightness") => {
+            let percent = parse_brightness_arg(arg);
+            let monitor = SystemSnapshot::collect().display.focused_monitor;
+            if monitor.is_empty() {
+                Ok(outcome(&format!("got {percent}"), None))
+            } else {
+                match run_action(&SystemAction::SetBrightness { monitor, percent }) {
+                    Ok(()) => Ok(outcome(&format!("got {percent}"), None)),
+                    Err(_) => Ok(outcome("error", None)),
+                }
+            }
+        }
+        ("omarchy.monitor", "state") => {
+            let display = SystemSnapshot::collect().display;
+            let value = serde_json::json!({
+                "brightness": display.brightness_percent.unwrap_or_default(),
+                "brightnessAvailable": display.brightness_available,
+                "focusedMonitor": display.focused_monitor,
+                "scale": display.monitor_scale,
+                "displays": display.displays.iter().map(|item| serde_json::json!({
+                    "name": item.name,
+                    "enabled": item.enabled,
+                    "focused": item.focused,
+                    "width": item.width,
+                    "height": item.height,
+                })).collect::<Vec<_>>(),
+            });
+            Ok(outcome(&value.to_string(), None))
+        }
+
+        ("omarchy.bluetooth", "toggleBluetooth") => {
+            let powered = SystemSnapshot::collect().bluetooth.powered;
+            match run_action(&SystemAction::SetBluetoothPower(!powered)) {
+                Ok(()) => Ok(outcome("ok", None)),
+                Err(_) => Ok(outcome("error", None)),
+            }
+        }
+        ("omarchy.network", "toggleNetwork") => {
+            let snapshot = SystemSnapshot::collect();
+            if snapshot.network.device.is_empty() {
+                Ok(outcome("error", None))
+            } else {
+                let action = if snapshot.network.available {
+                    SystemAction::DisconnectNetwork(snapshot.network.device)
+                } else {
+                    SystemAction::ActivateNetwork(snapshot.network.connection)
+                };
+                match run_action(&action) {
+                    Ok(()) => Ok(outcome("ok", None)),
+                    Err(_) => Ok(outcome("error", None)),
+                }
+            }
+        }
+        ("omarchy.network", "showQr") => Ok(outcome(
+            "ok",
+            Some(IpcEvent::Summon {
+                id: "omarchy.wifiqr".to_string(),
+                payload: "{}".to_string(),
+            }),
+        )),
+        ("omarchy.network", "speedTest") => Ok(outcome(
+            "ok",
+            Some(IpcEvent::Summon {
+                id: "omarchy.speedtest".to_string(),
+                payload: "{}".to_string(),
+            }),
+        )),
+
+        ("omarchy.power", "togglePercentage") => {
+            let current = snapshot_widget_bool(&runtime.snapshot, &id, "showPercentage");
+            let error = runtime.snapshot.set_bar_widget(
+                &id,
+                "showPercentage",
+                serde_json::Value::Bool(!current),
+                None,
+            )?;
+            if error.is_empty() {
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
+            } else {
+                Ok(outcome(&error, None))
+            }
+        }
+
+        ("omarchy.media", "status") => {
+            let media = SystemSnapshot::collect().media;
+            let value = serde_json::json!({
+                "hasPlayer": media.available,
+                "hasMedia": !media.title.is_empty() || !media.artist.is_empty(),
+                "playing": media.status.eq_ignore_ascii_case("playing"),
+                "identity": media.player,
+                "desktopEntry": "",
+                "title": media.title,
+                "artist": media.artist,
+                "album": "",
+                "artUrl": "",
+                "canGoNext": media.available,
+                "canGoPrevious": media.available,
+                "canTogglePlaying": media.available,
+            });
+            Ok(outcome(&value.to_string(), None))
+        }
+        ("omarchy.media", "playPause") => media_action(SystemAction::MediaPlayPause),
+        ("omarchy.media", "next") => media_action(SystemAction::MediaNext),
+        ("omarchy.media", "previous") => media_action(SystemAction::MediaPrevious),
+        ("omarchy.media", "play") => media_action(SystemAction::MediaPlayPause),
+        ("omarchy.media", "pause") => media_action(SystemAction::MediaPlayPause),
+        (
+            "omarchy.media",
+            "sourceNext" | "sourcePrevious" | "sourceSwitch" | "sourceSwitchPrevious",
+        ) => Ok(outcome("unhandled", None)),
+        ("omarchy.media", "ping") => Ok(outcome("ok", None)),
+
+        ("omarchy.nightlight", "status") => {
+            let nightlight = SystemSnapshot::collect().nightlight;
+            let value = serde_json::json!({
+                "enabled": nightlight.active,
+                "temperature": nightlight.temperature,
+            });
+            Ok(outcome(&value.to_string(), None))
+        }
+        ("omarchy.nightlight", "enable" | "disable" | "toggle") => {
+            let current = SystemSnapshot::collect().nightlight.active;
+            let enabling = match method {
+                "enable" => true,
+                "disable" => false,
+                _ => !current,
+            };
+            let result = if enabling == current {
+                Ok(())
+            } else {
+                run_action(&SystemAction::ToggleNightlight)
+            };
+            match result {
+                Ok(()) => Ok(outcome(if enabling { "enabled" } else { "disabled" }, None)),
+                Err(_) => Ok(outcome("error", None)),
+            }
+        }
+
+        ("omarchy.idle", "status" | "debug") => Ok(outcome(
+            &serde_json::json!({
+                "enabled": runtime.idle_enabled,
+                "stayAwake": false,
+                "stayAwakeStateLoaded": false,
+                "stayAwakeStatePath": "",
+                "idle": false,
+                "inIdleCycle": false,
+                "screensaverStarted": false,
+                "screensaver": 0,
+                "lock": 0,
+                "screensaverDelay": 0,
+                "lockDelay": 0,
+                "screensaverWindows": 0,
+                "timers": {
+                    "screensaver": false,
+                    "lock": false,
+                    "screensaverLaunchGrace": false,
+                },
+                "processes": {
+                    "screensaver": false,
+                    "lock": false,
+                    "wake": false,
+                },
+                "lastEvent": "",
+                "lastEventAt": 0,
+            })
+            .to_string(),
+            None,
+        )),
+        ("omarchy.idle", "enable" | "disable" | "toggle") => {
+            runtime.idle_enabled = match method {
+                "enable" => true,
+                "disable" => false,
+                _ => !runtime.idle_enabled,
+            };
+            Ok(outcome(
+                if runtime.idle_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                None,
+            ))
+        }
+
+        ("omarchy.lock", "isLocked") => Ok(outcome("false", None)),
+        ("omarchy.lock", "status") => Ok(outcome(
+            &serde_json::json!({
+                "locked": false,
+                "requested": false,
+                "pending": false,
+                "sessionLocked": false,
+                "secure": false,
+                "realScreens": 0,
+                "passwordPam": false,
+                "fingerprint": false,
+                "authenticating": false,
+                "lastEvent": "",
+                "lastEventAt": 0,
+            })
+            .to_string(),
+            None,
+        )),
+        ("omarchy.lock", "preview" | "hidePreview") => Ok(outcome("ok", None)),
+        ("omarchy.lock", "lock") => Ok(outcome("failed", None)),
+
+        ("omarchy.dropbox", "status") => Ok(outcome("Unavailable", None)),
+        ("omarchy.tailscale", "status") => Ok(outcome("Unavailable", None)),
+        ("omarchy.tailscale", "toggleTailscale" | "up" | "down") => Ok(outcome("ok", None)),
+        ("omarchy.weather", "edit") => Ok(outcome(
+            "ok",
+            Some(IpcEvent::Summon {
+                id: id.clone(),
+                payload: r#"{"edit":true}"#.to_string(),
+            }),
+        )),
+
+        ("omarchy.image-picker", "preload" | "cancel") => Ok(outcome("ok", None)),
+        _ => Ok(outcome("unknown", None)),
+    };
+    result
+}
+
+fn dispatch_call_lifecycle(
+    runtime: &mut IpcRuntime,
+    id: &str,
+    method: &str,
+    arg: &str,
+) -> CommandOutcome {
+    match method {
+        "open" | "show" => {
+            let Some(resolved) = summon_panel(runtime, id, arg) else {
+                return outcome("unknown", None);
+            };
+            outcome(
+                "ok",
+                Some(IpcEvent::Summon {
+                    id: resolved,
+                    payload: arg.to_string(),
+                }),
+            )
+        }
+        "close" | "hide" => {
+            runtime.open_panel_ids.remove(id);
+            outcome("ok", Some(IpcEvent::Hide { id: id.to_string() }))
+        }
+        "toggle" => {
+            if runtime.open_panel_ids.remove(id) {
+                outcome("ok", Some(IpcEvent::Hide { id: id.to_string() }))
+            } else {
+                let Some(resolved) = summon_panel(runtime, id, arg) else {
+                    return outcome("unknown", None);
+                };
+                outcome(
+                    "ok",
+                    Some(IpcEvent::Toggle {
+                        id: resolved,
+                        payload: arg.to_string(),
+                    }),
+                )
+            }
+        }
+        _ => outcome("unknown", None),
+    }
+}
+
+fn resolve_call_target(snapshot: &ShellSnapshot, requested: &str) -> Option<String> {
+    if snapshot.plugin(requested).is_some() {
+        return Some(requested.to_string());
+    }
+    let alias = match requested {
+        "image-selector" => Some("omarchy.image-picker"),
+        "background" => Some("omarchy.background"),
+        "indicators" => Some("omarchy.indicators"),
+        "system-update" => Some("omarchy.system-update"),
+        "lock" => Some("omarchy.lock"),
+        "notifications" => Some("omarchy.notifications"),
+        "osd" => Some("omarchy.osd"),
+        "idle" => Some("omarchy.idle"),
+        "media" => Some("omarchy.media"),
+        "nightlight" => Some("omarchy.nightlight"),
+        _ => None,
+    };
+    alias
+        .or_else(|| (!requested.starts_with("omarchy.")).then_some(requested))
+        .and_then(|id| {
+            if id.starts_with("omarchy.") {
+                snapshot.plugin(id).map(|_| id.to_string())
+            } else {
+                let candidate = format!("omarchy.{id}");
+                snapshot.plugin(&candidate).map(|_| candidate)
+            }
+        })
+}
+
+fn call_target_is_loaded(runtime: &IpcRuntime, id: &str) -> bool {
+    let Some(plugin) = runtime.snapshot.plugin(id) else {
+        return false;
+    };
+    runtime.open_panel_ids.contains(id)
+        || plugin.has_kind("service")
+        || plugin
+            .raw
+            .get("keepLoaded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || runtime
+            .snapshot
+            .left
+            .iter()
+            .chain(runtime.snapshot.center.iter())
+            .chain(runtime.snapshot.right.iter())
+            .any(|entry| entry.id == id)
+}
+
+fn call_method_supported(id: &str, method: &str) -> bool {
+    match id {
+        "omarchy.agents" => matches!(
+            method,
+            "open" | "close" | "show" | "hide" | "toggle" | "refresh" | "next"
+        ),
+        "omarchy.menu" => matches!(
+            method,
+            "open" | "close" | "show" | "hide" | "toggle" | "refresh" | "ping"
+        ),
+        "omarchy.background" => matches!(
+            method,
+            "refresh" | "set" | "setInstant" | "transition" | "themeTransition"
+        ),
+        "omarchy.indicators" => method == "refresh",
+        "omarchy.system-update" => matches!(method, "refresh" | "clear"),
+        "omarchy.lock" => matches!(
+            method,
+            "lock" | "isLocked" | "status" | "preview" | "hidePreview"
+        ),
+        "omarchy.notifications" => matches!(
+            method,
+            "dndState"
+                | "toggleDnd"
+                | "setDnd"
+                | "isDnd"
+                | "showHistory"
+                | "clear"
+                | "dismissAll"
+                | "dismissOne"
+                | "invokeLast"
+                | "dismiss"
+                | "ping"
+        ),
+        "omarchy.osd" => matches!(method, "show" | "close" | "state" | "ping"),
+        "omarchy.audio" | "omarchy.bluetooth" | "omarchy.clock" | "omarchy.monitor"
+        | "omarchy.network" | "omarchy.power" | "omarchy.tailscale" | "omarchy.weather" => {
+            matches!(method, "open" | "close" | "show" | "hide" | "toggle")
+                || match id {
+                    "omarchy.bluetooth" => method == "toggleBluetooth",
+                    "omarchy.clock" => {
+                        matches!(method, "refresh" | "cycleFormat" | "toggleWeekStart")
+                    }
+                    "omarchy.monitor" => matches!(method, "brightness" | "state"),
+                    "omarchy.network" => {
+                        matches!(method, "toggleNetwork" | "showQr" | "speedTest")
+                    }
+                    "omarchy.power" => method == "togglePercentage",
+                    "omarchy.tailscale" => {
+                        matches!(
+                            method,
+                            "refresh" | "up" | "down" | "toggleTailscale" | "status"
+                        )
+                    }
+                    "omarchy.weather" => matches!(method, "refresh" | "edit"),
+                    "omarchy.audio" => false,
+                    _ => false,
+                }
+        }
+        "omarchy.dropbox" => matches!(
+            method,
+            "open" | "close" | "show" | "hide" | "toggle" | "refresh" | "login" | "status"
+        ),
+        "omarchy.media" => matches!(
+            method,
+            "status"
+                | "playPause"
+                | "next"
+                | "previous"
+                | "play"
+                | "pause"
+                | "sourceNext"
+                | "sourcePrevious"
+                | "sourceSwitch"
+                | "sourceSwitchPrevious"
+                | "ping"
+        ),
+        "omarchy.nightlight" => {
+            matches!(
+                method,
+                "status" | "refresh" | "enable" | "disable" | "toggle"
+            )
+        }
+        "omarchy.idle" => matches!(method, "status" | "debug" | "enable" | "disable" | "toggle"),
+        "omarchy.image-picker" => {
+            matches!(method, "open" | "close" | "preload" | "cancel" | "ping")
+        }
+        "omarchy.clipboard"
+        | "omarchy.emojis"
+        | "omarchy.reminders"
+        | "omarchy.dev-gallery"
+        | "omarchy.disk-speedtest"
+        | "omarchy.speedtest"
+        | "omarchy.wifiqr" => {
+            matches!(method, "open" | "close" | "toggle")
+        }
+        _ => false,
+    }
+}
+
+fn parse_bool_arg(arg: &str) -> bool {
+    matches!(
+        arg.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "on" | "yes"
+    )
+}
+
+fn parse_brightness_arg(arg: &str) -> u8 {
+    arg.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| value.round().clamp(1.0, 100.0) as u8)
+        .unwrap_or(1)
+}
+
+fn snapshot_widget_bool(snapshot: &ShellSnapshot, id: &str, key: &str) -> bool {
+    snapshot
+        .left
+        .iter()
+        .chain(snapshot.center.iter())
+        .chain(snapshot.right.iter())
+        .find(|entry| entry.id == id)
+        .and_then(|entry| entry.settings.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn media_action(action: SystemAction) -> Result<CommandOutcome, String> {
+    Ok(outcome(
+        if run_action(&action).is_ok() {
+            "ok"
+        } else {
+            "unhandled"
+        },
+        None,
+    ))
 }
 
 fn outcome(output: &str, event: Option<IpcEvent>) -> CommandOutcome {
@@ -753,6 +1289,56 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn call_dispatches_loaded_lifecycle_and_plugin_state_handlers() {
+        let (root, snapshot) = fixture();
+        let mut runtime = IpcRuntime::new(snapshot);
+
+        let open = parse(&args(&["shell", "call", "omarchy.audio", "open"])).unwrap();
+        let result = dispatch_runtime(&open, &mut runtime).unwrap();
+        assert_eq!(result.output, "ok");
+        assert_eq!(
+            result.event,
+            Some(IpcEvent::Summon {
+                id: "omarchy.audio".to_string(),
+                payload: String::new(),
+            })
+        );
+
+        let close = parse(&args(&["shell", "call", "omarchy.audio", "close"])).unwrap();
+        let result = dispatch_runtime(&close, &mut runtime).unwrap();
+        assert_eq!(result.output, "ok");
+        assert_eq!(
+            result.event,
+            Some(IpcEvent::Hide {
+                id: "omarchy.audio".to_string(),
+            })
+        );
+
+        let dnd_state = parse(&args(&["shell", "call", "notifications", "dndState"])).unwrap();
+        assert_eq!(
+            dispatch_runtime(&dnd_state, &mut runtime).unwrap().output,
+            "off"
+        );
+        let toggle_dnd = parse(&args(&["shell", "call", "notifications", "toggleDnd"])).unwrap();
+        assert_eq!(
+            dispatch_runtime(&toggle_dnd, &mut runtime).unwrap().output,
+            "on"
+        );
+        let set_dnd = parse(&args(&["shell", "call", "notifications", "setDnd", "no"])).unwrap();
+        assert_eq!(
+            dispatch_runtime(&set_dnd, &mut runtime).unwrap().output,
+            "off"
+        );
+
+        let unknown = parse(&args(&["shell", "call", "omarchy.audio", "nope"])).unwrap();
+        assert_eq!(
+            dispatch_runtime(&unknown, &mut runtime).unwrap().output,
+            "unknown"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn fixture() -> (PathBuf, ShellSnapshot) {
         let root = std::env::temp_dir().join(format!(
             "omarchy-gpui-ipc-{}-{}",
@@ -778,6 +1364,13 @@ mod tests {
             )
             .expect("write plugin fixture");
         }
+        let directory = omarchy.join("shell/plugins/omarchy.notifications");
+        fs::create_dir_all(&directory).expect("create notifications fixture");
+        fs::write(
+            directory.join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"omarchy.notifications","name":"Notifications","version":"1.0.0","kinds":["service"],"entryPoints":{"service":"Service.qml"}}"#,
+        )
+        .expect("write notifications fixture");
         (
             root.clone(),
             ShellSnapshot::load_from_paths(&omarchy, &home),
