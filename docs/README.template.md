@@ -39,7 +39,7 @@ cargo test --offline
 
 The native GPUI layer-shell bar, configuration loader, manifest discovery, and
 initial command surface are implemented. The complete parity inventory is in
-[`PARITY.md`](../PARITY.md); the project must not be described as a complete
+[`PARITY.md`](PARITY.md); the project must not be described as a complete
 replacement until all parity gates are green.
 
 ## Development policy
@@ -49,5 +49,5 @@ README/status files, and synchronizes the GitHub repository description through
 the authenticated `gh` CLI. Commits are pushed to the public `origin` remote in
 small verified increments.
 
-See [`PLAN.md`](../PLAN.md), [`GATES.md`](../GATES.md), and
-[`PARITY.md`](../PARITY.md) for the active implementation and evidence ledgers.
+See [`PLAN.md`](PLAN.md), [`GATES.md`](GATES.md), and
+[`PARITY.md`](PARITY.md) for the active implementation and evidence ledgers.
