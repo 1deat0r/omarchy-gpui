@@ -42,6 +42,50 @@ impl SystemSnapshot {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemAction {
+    FocusWorkspace(String),
+    ToggleOutputMute,
+    ToggleInputMute,
+    SetOutputVolume(u8),
+    MediaPlayPause,
+    MediaNext,
+    MediaPrevious,
+    SetBluetoothPower(bool),
+    ActivateNetwork(String),
+}
+
+pub fn run_action(action: &SystemAction) -> Result<(), String> {
+    match action {
+        SystemAction::FocusWorkspace(workspace) => {
+            validate_argument(workspace, "workspace")?;
+            command("hyprctl", &["dispatch", "workspace", workspace]).map(|_| ())
+        }
+        SystemAction::ToggleOutputMute => {
+            command("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]).map(|_| ())
+        }
+        SystemAction::ToggleInputMute => {
+            command("wpctl", &["set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"]).map(|_| ())
+        }
+        SystemAction::SetOutputVolume(percent) => {
+            let value = format!("{:.2}", f32::from(*percent) / 100.0);
+            command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &value]).map(|_| ())
+        }
+        SystemAction::MediaPlayPause => command("playerctl", &["-a", "play-pause"]).map(|_| ()),
+        SystemAction::MediaNext => command("playerctl", &["-a", "next"]).map(|_| ()),
+        SystemAction::MediaPrevious => command("playerctl", &["-a", "previous"]).map(|_| ()),
+        SystemAction::SetBluetoothPower(powered) => command(
+            "bluetoothctl",
+            &["power", if *powered { "on" } else { "off" }],
+        )
+        .map(|_| ()),
+        SystemAction::ActivateNetwork(connection) => {
+            validate_argument(connection, "network connection")?;
+            command("nmcli", &["connection", "up", "id", connection]).map(|_| ())
+        }
+    }
+}
+
 pub fn to_value(snapshot: &SystemSnapshot) -> Value {
     serde_json::json!({
         "collectedAt": snapshot.collected_at,
@@ -489,6 +533,13 @@ fn command(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn validate_argument(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(format!("invalid {label}"));
+    }
+    Ok(())
+}
+
 fn command_json(program: &str, args: &[&str]) -> Result<Value, String> {
     let raw = command(program, args)?;
     serde_json::from_str(&raw).map_err(|error| format!("{program} returned invalid JSON: {error}"))
@@ -499,8 +550,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        parse_bluetooth_show, parse_hyprland, parse_nmcli_device_status, parse_playerctl_metadata,
-        parse_upower_display, parse_wpctl_volume,
+        SystemAction, parse_bluetooth_show, parse_hyprland, parse_nmcli_device_status,
+        parse_playerctl_metadata, parse_upower_display, parse_wpctl_volume, run_action,
     };
 
     #[test]
@@ -567,5 +618,11 @@ mod tests {
         assert!(parsed.available);
         assert_eq!(parsed.status, "Playing");
         assert_eq!(parsed.title, "Title");
+    }
+
+    #[test]
+    fn rejects_control_characters_before_shell_action() {
+        let result = run_action(&SystemAction::FocusWorkspace(String::from("1\nquit")));
+        assert_eq!(result, Err("invalid workspace".to_string()));
     }
 }

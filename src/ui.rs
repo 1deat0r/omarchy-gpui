@@ -11,7 +11,7 @@ use gpui::{
 
 use crate::config::{BarEntry, ShellSnapshot};
 use crate::ipc::{IpcEvent, IpcEventReceiver};
-use crate::system::SystemSnapshot;
+use crate::system::{SystemAction, SystemSnapshot, run_action};
 
 pub struct ShellView {
     snapshot: ShellSnapshot,
@@ -101,6 +101,24 @@ impl ShellView {
         }
 
         for entry in entries {
+            if entry.id == "omarchy.workspaces" && !system.hyprland.workspaces.is_empty() {
+                for workspace in &system.hyprland.workspaces {
+                    let label = if workspace.name == system.hyprland.active_workspace {
+                        format!("● {}", workspace.name)
+                    } else {
+                        format!("○ {}", workspace.name)
+                    };
+                    let workspace_name = workspace.name.clone();
+                    let id = format!("omarchy-workspace-{}", workspace.name);
+                    group = group.child(Self::chip(&label, &id).cursor_pointer().on_click(
+                        move |_, _, _| {
+                            let _ =
+                                run_action(&SystemAction::FocusWorkspace(workspace_name.clone()));
+                        },
+                    ));
+                }
+                continue;
+            }
             let label = label_for_entry(entry, clock, system);
             let _settings_are_preserved = &entry.settings;
             let id = entry.id.clone();
@@ -253,16 +271,95 @@ impl Render for ShellView {
 struct PanelView {
     id: String,
     system: SystemSnapshot,
+    message: String,
 }
 
 impl PanelView {
     fn new(id: String, system: SystemSnapshot) -> Self {
-        Self { id, system }
+        Self {
+            id,
+            system,
+            message: String::new(),
+        }
+    }
+
+    fn execute(&mut self, action: SystemAction, cx: &mut Context<Self>) {
+        self.message = match run_action(&action) {
+            Ok(()) => "Action sent".to_string(),
+            Err(error) => error,
+        };
+        cx.notify();
+    }
+
+    fn action_button(
+        &self,
+        label: &str,
+        action: SystemAction,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let id = format!(
+            "omarchy-gpui-action-{}",
+            label.to_lowercase().replace(' ', "-")
+        );
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x27272a))
+            .border_1()
+            .border_color(rgb(0x3f3f46))
+            .child(label.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.execute(action.clone(), cx);
+            }))
+    }
+
+    fn actions(&self, cx: &mut Context<Self>) -> Div {
+        let mut actions = div().flex().gap_2().mt_4();
+        match self.id.as_str() {
+            "omarchy.audio" => {
+                actions = actions
+                    .child(self.action_button("Mute output", SystemAction::ToggleOutputMute, cx))
+                    .child(self.action_button("Mute input", SystemAction::ToggleInputMute, cx))
+                    .child(self.action_button("Set 50%", SystemAction::SetOutputVolume(50), cx));
+            }
+            "omarchy.bluetooth" => {
+                actions = actions.child(self.action_button(
+                    if self.system.bluetooth.powered {
+                        "Power off"
+                    } else {
+                        "Power on"
+                    },
+                    SystemAction::SetBluetoothPower(!self.system.bluetooth.powered),
+                    cx,
+                ));
+            }
+            "omarchy.media" => {
+                actions = actions
+                    .child(self.action_button("Previous", SystemAction::MediaPrevious, cx))
+                    .child(self.action_button("Play/Pause", SystemAction::MediaPlayPause, cx))
+                    .child(self.action_button("Next", SystemAction::MediaNext, cx));
+            }
+            "omarchy.network"
+                if !self.system.network.connection.is_empty()
+                    && self.system.network.connection != "--" =>
+            {
+                actions = actions.child(self.action_button(
+                    "Reconnect",
+                    SystemAction::ActivateNetwork(self.system.network.connection.clone()),
+                    cx,
+                ));
+            }
+            _ => {}
+        }
+        actions
     }
 }
 
 impl Render for PanelView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = label_for(&self.id).to_string();
         let mut rows = div().flex().flex_col().gap_2().mt_3();
         for (label, value) in panel_rows(&self.id, &self.system) {
@@ -303,6 +400,15 @@ impl Render for PanelView {
                     ),
             )
             .child(rows)
+            .child(self.actions(cx))
+            .when(!self.message.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .mt_3()
+                        .text_color(rgb(0xa1a1aa))
+                        .child(self.message.clone()),
+                )
+            })
     }
 }
 
