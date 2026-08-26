@@ -1,6 +1,7 @@
 mod config;
 mod ipc;
 mod menu;
+mod overlays;
 mod system;
 mod ui;
 

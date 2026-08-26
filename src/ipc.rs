@@ -584,6 +584,7 @@ fn dispatch_call(
             Ok(outcome("none", None))
         }
         ("omarchy.notifications", "ping") => Ok(outcome("ok", None)),
+        ("omarchy.menu", "ping") => Ok(outcome("ok", None)),
 
         ("omarchy.osd", "show") => {
             runtime.osd_open = true;
