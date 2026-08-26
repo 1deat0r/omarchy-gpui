@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+quiet=0
+if [[ ${1:-} == "-q" ]]; then
+  quiet=1
+  shift
+fi
+
+if (( $# < 2 )); then
+  if (( quiet )); then
+    exit 0
+  fi
+  printf '%s\n' 'Usage: omarchy-shell [-q] <target> <method> [args...]' >&2
+  exit 1
+fi
+
+project_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ -n ${OMARCHY_GPUI_BIN:-} ]]; then
+  shell_bin=$OMARCHY_GPUI_BIN
+elif command -v omarchy-gpui-shell >/dev/null 2>&1; then
+  shell_bin=$(command -v omarchy-gpui-shell)
+elif [[ -x $project_root/target/debug/omarchy-gpui-shell ]]; then
+  shell_bin=$project_root/target/debug/omarchy-gpui-shell
+elif [[ -x $project_root/target/release/omarchy-gpui-shell ]]; then
+  shell_bin=$project_root/target/release/omarchy-gpui-shell
+else
+  if (( quiet )); then
+    exit 0
+  fi
+  printf '%s\n' 'omarchy-gpui-shell is not installed or built' >&2
+  exit 1
+fi
+
+if output=$("$shell_bin" "$@" 2>&1); then
+  if (( !quiet )) && [[ -n $output ]]; then
+    printf '%s\n' "$output"
+  fi
+  exit 0
+fi
+
+if (( quiet )); then
+  exit 0
+fi
+printf '%s\n' "$output" >&2
+exit 1

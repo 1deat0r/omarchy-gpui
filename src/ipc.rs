@@ -1,3 +1,16 @@
+use std::{
+    fs,
+    io::{Read, Write},
+    net::Shutdown,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
 use crate::config::ShellSnapshot;
 
 pub const IPC_METHODS: &[&str] = &[
@@ -76,6 +89,178 @@ pub enum ShellCommand {
         id: String,
         enabled: bool,
     },
+}
+
+/// A small JSON-lines Unix-socket bridge for the long-lived GPUI shell.
+///
+/// Omarchy's installed helper talks to a running Quickshell process.  Keeping
+/// the transport separate from command parsing lets the same dispatch logic be
+/// tested directly and used by the live GPUI process.  The wire envelope is
+/// intentionally private to this port; `try_call_running` exposes the same
+/// one-line result the CLI caller expects.
+pub struct IpcServer {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl IpcServer {
+    pub fn start(snapshot: ShellSnapshot) -> Result<Self, String> {
+        let path = socket_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("create IPC directory: {error}"))?;
+        }
+
+        if path.exists() {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "GPUI shell is already running at {}",
+                        path.display()
+                    ));
+                }
+                Err(_) => fs::remove_file(&path)
+                    .map_err(|error| format!("remove stale IPC socket: {error}"))?,
+            }
+        }
+
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .map_err(|error| format!("bind IPC socket {}: {error}", path.display()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("configure IPC socket: {error}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let state = Arc::new(Mutex::new(snapshot));
+        let thread = thread::Builder::new()
+            .name("omarchy-gpui-ipc".to_string())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => handle_connection(stream, &state),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("start IPC thread: {error}"))?;
+
+        Ok(Self {
+            path,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Try the live shell first. `None` means there is no active GPUI server and
+/// the caller may use the direct command path for offline contract tests.
+pub fn try_call_running(args: &[String]) -> Result<Option<String>, String> {
+    let path = socket_path();
+    let mut stream = match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("connect to GPUI shell: {error}")),
+    };
+    let request = serde_json::json!({"args": args});
+    stream
+        .write_all(request.to_string().as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .map_err(|error| format!("write GPUI shell IPC request: {error}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| format!("finish GPUI shell IPC request: {error}"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|error| format!("read GPUI shell IPC response: {error}"))?;
+    let response: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|error| format!("invalid GPUI shell response: {error}"))?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(Some(
+            response
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ))
+    } else {
+        Err(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("GPUI shell IPC request failed")
+            .to_string())
+    }
+}
+
+fn handle_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    state: &Arc<Mutex<ShellSnapshot>>,
+) {
+    let mut raw = String::new();
+    let response = match stream.read_to_string(&mut raw) {
+        Ok(_) => handle_request(raw.trim(), state),
+        Err(error) => serde_json::json!({"ok": false, "error": format!("read request: {error}")}),
+    };
+    let _ = stream.write_all(response.to_string().as_bytes());
+    let _ = stream.write_all(b"\n");
+}
+
+fn handle_request(raw: &str, state: &Arc<Mutex<ShellSnapshot>>) -> serde_json::Value {
+    let args = match serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.get("args").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .and_then(|values| {
+            values
+                .into_iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        }) {
+        Some(args) => args,
+        None => return serde_json::json!({"ok": false, "error": "invalid IPC request"}),
+    };
+
+    let result = state
+        .lock()
+        .map_err(|_| "IPC state lock poisoned".to_string())
+        .and_then(|mut snapshot| {
+            parse(&args).and_then(|command| dispatch(&command, &mut snapshot))
+        });
+    match result {
+        Ok(output) => serde_json::json!({"ok": true, "output": output}),
+        Err(error) => serde_json::json!({"ok": false, "error": error}),
+    }
+}
+
+fn socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("OMARCHY_GPUI_SOCKET") {
+        return PathBuf::from(path);
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    runtime.join("omarchy-gpui-shell.sock")
 }
 
 pub fn parse(args: &[String]) -> Result<ShellCommand, String> {

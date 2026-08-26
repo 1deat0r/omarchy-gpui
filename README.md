@@ -30,15 +30,22 @@ Useful checks:
 
 ```bash
 cargo run --offline -- --print-contract
+cargo run --offline -- --print-system
 cargo run --offline -- shell ping
 WAYLAND_DISPLAY=wayland-1 cargo run --offline -- --smoke
 cargo test --offline
 ```
 
+The repository also includes `bin/omarchy-shell`, a compatibility launcher for
+the GPUI shell IPC surface. When the GPUI process is running, it forwards
+commands over the per-user runtime socket; when it is not running, the binary
+still exposes direct configuration-contract commands for tests.
+
 ## Project state
 
-The native GPUI layer-shell bar, configuration loader, manifest discovery, and
-initial command surface are implemented. The complete parity inventory is in
+The native GPUI layer-shell bar, configuration loader, manifest discovery, live
+IPC transport, and first read-only system adapters are implemented. The
+complete parity inventory is in
 [`PARITY.md`](PARITY.md); the project must not be described as a complete
 replacement until all parity gates are green.
 
