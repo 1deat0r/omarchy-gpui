@@ -20,6 +20,7 @@ pub struct PluginSnapshot {
     pub keyboard: KeyboardLayoutState,
     pub weather: WeatherState,
     pub idle: IdleState,
+    pub indicators: IndicatorState,
     pub dropbox: DropboxState,
     pub tailscale: TailscaleState,
 }
@@ -32,6 +33,7 @@ impl PluginSnapshot {
             keyboard: KeyboardLayoutState::collect(),
             weather: WeatherState::collect(omarchy_path),
             idle: IdleState::collect(),
+            indicators: IndicatorState::collect(),
             dropbox: DropboxState::collect_dropbox(omarchy_path),
             tailscale: TailscaleState::collect(),
         }
@@ -295,6 +297,83 @@ impl IdleState {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndicatorState {
+    pub dictation: String,
+    pub recording: bool,
+    pub reminder_count: u64,
+    pub reminder_tooltip: String,
+    pub dnd: bool,
+    pub stay_awake: bool,
+    pub error: Option<String>,
+}
+
+impl IndicatorState {
+    fn collect() -> Self {
+        let dictation = command_output("omarchy-voxtype-status", &[])
+            .ok()
+            .and_then(|raw| parse_dictation_state(&raw))
+            .unwrap_or_default();
+        let recording = Command::new("pgrep")
+            .args(["--quiet", "-f", "^gpu-screen-recorder"])
+            .status()
+            .is_ok_and(|status| status.success());
+        let (reminder_count, reminder_tooltip) =
+            command_output("omarchy-reminder", &["show", "--json"])
+                .ok()
+                .map(|raw| parse_reminder_indicator(&raw))
+                .unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let dnd = fs::read_to_string(home.join(".local/state/omarchy/notifications.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.get("dnd").and_then(Value::as_bool))
+            .unwrap_or(false);
+        let stay_awake = fs::metadata(home.join(".local/state/omarchy/indicators/stay-awake"))
+            .is_ok_and(|metadata| metadata.is_file());
+        Self {
+            dictation,
+            recording,
+            reminder_count,
+            reminder_tooltip,
+            dnd,
+            stay_awake,
+            error: None,
+        }
+    }
+}
+
+pub fn parse_dictation_state(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    Some(
+        value
+            .get("alt")
+            .or_else(|| value.get("class"))
+            .and_then(Value::as_str)
+            .unwrap_or("idle")
+            .to_string(),
+    )
+}
+
+pub fn parse_reminder_indicator(raw: &str) -> (u64, String) {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return (0, String::new());
+    };
+    (
+        value
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        value
+            .get("tooltip")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DropboxState {
     pub installed: bool,
@@ -548,8 +627,9 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_default_agent, parse_dropbox_status, parse_keyboard_devices, parse_network_qr,
-        parse_tailscale_status, parse_update_status, parse_weather_status,
+        parse_default_agent, parse_dictation_state, parse_dropbox_status, parse_keyboard_devices,
+        parse_network_qr, parse_reminder_indicator, parse_tailscale_status, parse_update_status,
+        parse_weather_status,
     };
 
     #[test]
@@ -603,5 +683,18 @@ mod tests {
         assert_eq!(state.used_bytes, 1200);
         assert_eq!(state.quota_bytes, 2000);
         assert!(state.quota_known);
+    }
+
+    #[test]
+    fn indicator_parsers_preserve_reference_states() {
+        assert_eq!(
+            parse_dictation_state(r#"{"alt":"transcribing","class":"busy"}"#),
+            Some("transcribing".to_string())
+        );
+        assert_eq!(
+            parse_reminder_indicator(r#"{"count":2,"tooltip":"Due soon"}"#),
+            (2, "Due soon".to_string())
+        );
+        assert_eq!(parse_reminder_indicator("bad"), (0, String::new()));
     }
 }

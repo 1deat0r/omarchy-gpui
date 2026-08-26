@@ -21,7 +21,7 @@ use crate::overlays::{
     emoji_rows_from_path, image_rows_from_payload, parse_image_picker_payload, reminder_args,
     valid_reminder_minutes,
 };
-use crate::plugins::{PluginSnapshot, parse_network_qr};
+use crate::plugins::{IndicatorState, PluginSnapshot, parse_network_qr};
 use crate::system::{BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action};
 
 pub struct ShellView {
@@ -142,6 +142,23 @@ impl ShellView {
         }
 
         for entry in entries {
+            if entry.id == "omarchy.indicators" {
+                let indicators = indicator_bar_items(&plugins.indicators, system);
+                for (indicator_id, label, active) in indicators {
+                    if !active {
+                        continue;
+                    }
+                    let click_id = indicator_id.clone();
+                    group = group.child(
+                        Self::chip(&label, &format!("omarchy-indicator-{indicator_id}"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.handle_indicator_click(&click_id, window, cx);
+                            })),
+                    );
+                }
+                continue;
+            }
             if entry.id == "omarchy.workspaces" && !system.hyprland.workspaces.is_empty() {
                 for workspace in &system.hyprland.workspaces {
                     let label = if workspace.name == system.hyprland.active_workspace {
@@ -185,6 +202,48 @@ impl ShellView {
             }));
         }
         group
+    }
+
+    fn handle_indicator_click(
+        &mut self,
+        indicator: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match indicator {
+            "Dictation" => {
+                let _ = Command::new("omarchy-voxtype-config").spawn();
+            }
+            "ScreenRecording" => {
+                if self.plugins.indicators.recording {
+                    let _ = Command::new("omarchy-capture-screenrecording")
+                        .arg("--stop-recording")
+                        .spawn();
+                } else {
+                    let _ = Command::new("omarchy-menu")
+                        .args(["toggle", "trigger.capture.screenrecord"])
+                        .spawn();
+                }
+            }
+            "Reminder" => {
+                self.open_panel("omarchy.reminders", "{}", cx);
+            }
+            "NightLight" => {
+                let _ = run_action(&SystemAction::SetNightlight(!self.system.nightlight.active));
+            }
+            "Dnd" => {
+                let executable =
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                let _ = Command::new(executable)
+                    .args(["notifications", "toggleDnd"])
+                    .spawn();
+            }
+            "StayAwake" => {
+                let _ = Command::new("omarchy-toggle-idle").arg("toggle").spawn();
+            }
+            _ => {}
+        }
+        let _ = window;
     }
 
     fn handle_bar_click(
@@ -2452,6 +2511,44 @@ fn yes_no(value: bool) -> String {
     } else {
         "No".to_string()
     }
+}
+
+fn indicator_bar_items(
+    indicators: &IndicatorState,
+    system: &SystemSnapshot,
+) -> Vec<(String, String, bool)> {
+    vec![
+        (
+            "Dictation".to_string(),
+            if indicators.dictation == "recording" {
+                "󰍬".to_string()
+            } else {
+                "󰔟".to_string()
+            },
+            matches!(indicators.dictation.as_str(), "recording" | "transcribing"),
+        ),
+        (
+            "ScreenRecording".to_string(),
+            "󰻂".to_string(),
+            indicators.recording,
+        ),
+        (
+            "Reminder".to_string(),
+            "󰢌".to_string(),
+            indicators.reminder_count > 0,
+        ),
+        (
+            "NightLight".to_string(),
+            "󰔎".to_string(),
+            system.nightlight.active,
+        ),
+        ("Dnd".to_string(), "󰂛".to_string(), indicators.dnd),
+        (
+            "StayAwake".to_string(),
+            "󰅶".to_string(),
+            indicators.stay_awake,
+        ),
+    ]
 }
 
 fn entry_visible(entry: &BarEntry, plugins: &PluginSnapshot, system: &SystemSnapshot) -> bool {
