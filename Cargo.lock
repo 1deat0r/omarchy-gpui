@@ -3454,6 +3454,7 @@ dependencies = [
  "gpui_platform",
  "libc",
  "serde_json",
+ "zbus",
 ]
 
 [[package]]

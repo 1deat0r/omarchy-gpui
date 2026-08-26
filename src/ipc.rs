@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::config::ShellSnapshot;
+use crate::dbus;
 use crate::plugins::{parse_dropbox_status, parse_tailscale_status};
 use crate::system::{SystemAction, SystemSnapshot, run_action};
 
@@ -927,7 +928,7 @@ fn dispatch_call(
                 media
                     .players
                     .iter()
-                    .find(|player| player.player == runtime.preferred_media_player)
+                    .find(|player| player.key() == runtime.preferred_media_player)
                     .or_else(|| media.players.first())
             };
             let player = selected
@@ -948,19 +949,22 @@ fn dispatch_call(
             let art_url = selected
                 .map(|player| player.art_url.as_str())
                 .unwrap_or_default();
+            let desktop_entry = selected
+                .map(|player| player.desktop_entry.as_str())
+                .unwrap_or_default();
             let value = serde_json::json!({
                 "hasPlayer": selected.is_some(),
                 "hasMedia": !title.is_empty() || !artist.is_empty(),
                 "playing": status.eq_ignore_ascii_case("playing"),
                 "identity": player,
-                "desktopEntry": "",
+                "desktopEntry": desktop_entry,
                 "title": title,
                 "artist": artist,
                 "album": album,
                 "artUrl": art_url,
-                "canGoNext": selected.is_some(),
-                "canGoPrevious": selected.is_some(),
-                "canTogglePlaying": selected.is_some(),
+                "canGoNext": selected.is_some_and(|player| player.can_go_next),
+                "canGoPrevious": selected.is_some_and(|player| player.can_go_previous),
+                "canTogglePlaying": selected.is_some_and(|player| player.can_toggle_playing()),
             });
             Ok(outcome(&value.to_string(), None))
         }
@@ -975,7 +979,12 @@ fn dispatch_call(
         ) => {
             let media = SystemSnapshot::collect().media;
             let current = if runtime.preferred_media_player.is_empty() {
-                media.player.as_str()
+                media
+                    .players
+                    .iter()
+                    .find(|player| player.player == media.player)
+                    .map(|player| player.key())
+                    .unwrap_or_default()
             } else {
                 runtime.preferred_media_player.as_str()
             };
@@ -988,10 +997,7 @@ fn dispatch_call(
                 .players
                 .iter()
                 .filter(|player| {
-                    !player.player.is_empty()
-                        && (!player.title.is_empty()
-                            || !player.artist.is_empty()
-                            || player.status.eq_ignore_ascii_case("playing"))
+                    !player.key().is_empty() && player.has_metadata() && player.can_toggle_playing()
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by(|left, right| left.player.cmp(&right.player));
@@ -1000,26 +1006,26 @@ fn dispatch_call(
             } else {
                 let current_index = candidates
                     .iter()
-                    .position(|player| player.player == current)
+                    .position(|player| player.key() == current)
                     .unwrap_or(0);
                 let next_index =
                     (current_index as isize + delta).rem_euclid(candidates.len() as isize) as usize;
                 let next = candidates[next_index];
                 let transfer = matches!(method, "sourceSwitch" | "sourceSwitchPrevious");
                 if transfer
-                    && next.player != current
+                    && next.key() != current
                     && media
                         .players
                         .iter()
-                        .find(|player| player.player == current)
+                        .find(|player| player.key() == current)
                         .is_some_and(|player| player.status.eq_ignore_ascii_case("playing"))
                 {
-                    if media_player_action(&next.player, "play").is_err() {
+                    if media_player_action(next.key(), "play").is_err() {
                         return Ok(outcome("unhandled", None));
                     }
                     let _ = media_player_action(current, "pause");
                 }
-                runtime.preferred_media_player = next.player.clone();
+                runtime.preferred_media_player = next.key().to_string();
                 Ok(outcome("ok", None))
             }
         }
@@ -1388,7 +1394,17 @@ fn media_player_action(player: &str, action: &str) -> Result<(), String> {
     if !matches!(action, "play" | "pause" | "play-pause") {
         return Err("invalid media action".to_string());
     }
-    command_output("playerctl", &["--player", player, action]).map(|_| ())
+    let method = match action {
+        "play" => "Play",
+        "pause" => "Pause",
+        "play-pause" => "PlayPause",
+        _ => unreachable!(),
+    };
+    if player.starts_with("org.mpris.MediaPlayer2.") {
+        dbus::call_player(player, method)
+    } else {
+        command_output("playerctl", &["--player", player, action]).map(|_| ())
+    }
 }
 
 fn validate_ipc_argument(value: &str, label: &str) -> Result<(), String> {

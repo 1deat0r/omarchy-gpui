@@ -19,6 +19,8 @@ use std::{
 
 use serde_json::Value;
 
+use crate::dbus;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SystemSnapshot {
     pub hyprland: HyprlandState,
@@ -159,11 +161,11 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             let value = format!("{:.2}", f32::from(*percent) / 100.0);
             command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &value]).map(|_| ())
         }
-        SystemAction::MediaPlayPause => command("playerctl", &["-a", "play-pause"]).map(|_| ()),
-        SystemAction::MediaPlay => command("playerctl", &["-a", "play"]).map(|_| ()),
-        SystemAction::MediaPause => command("playerctl", &["-a", "pause"]).map(|_| ()),
-        SystemAction::MediaNext => command("playerctl", &["-a", "next"]).map(|_| ()),
-        SystemAction::MediaPrevious => command("playerctl", &["-a", "previous"]).map(|_| ()),
+        SystemAction::MediaPlayPause => media_action("PlayPause", &["-a", "play-pause"]),
+        SystemAction::MediaPlay => media_action("Play", &["-a", "play"]),
+        SystemAction::MediaPause => media_action("Pause", &["-a", "pause"]),
+        SystemAction::MediaNext => media_action("Next", &["-a", "next"]),
+        SystemAction::MediaPrevious => media_action("Previous", &["-a", "previous"]),
         SystemAction::SetWifiEnabled(enabled) => command(
             "nmcli",
             &["radio", "wifi", if *enabled { "on" } else { "off" }],
@@ -282,6 +284,19 @@ fn command_present(program: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+fn media_action(method: &str, playerctl_args: &[&str]) -> Result<(), String> {
+    match dbus::call_default_player(method) {
+        Ok(()) => Ok(()),
+        Err(dbus_error) => command("playerctl", playerctl_args).map(|_| ()).map_err(
+            |fallback_error| {
+                format!(
+                    "MPRIS unavailable ({dbus_error}); playerctl fallback failed ({fallback_error})"
+                )
+            },
+        ),
+    }
+}
+
 pub fn to_value(snapshot: &SystemSnapshot) -> Value {
     serde_json::json!({
         "collectedAt": snapshot.collected_at,
@@ -393,11 +408,17 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "title": snapshot.media.title,
             "players": snapshot.media.players.iter().map(|player| serde_json::json!({
                 "player": player.player,
+                "busName": player.bus_name,
+                "desktopEntry": player.desktop_entry,
                 "status": player.status,
                 "artist": player.artist,
                 "title": player.title,
                 "album": player.album,
                 "artUrl": player.art_url,
+                "canGoNext": player.can_go_next,
+                "canGoPrevious": player.can_go_previous,
+                "canPlay": player.can_play,
+                "canPause": player.can_pause,
             })).collect::<Vec<_>>(),
             "error": snapshot.media.error,
         },
@@ -1164,11 +1185,35 @@ pub fn parse_battery_shell(raw: &str) -> BatteryState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaPlayerState {
     pub player: String,
+    pub bus_name: String,
+    pub desktop_entry: String,
     pub status: String,
     pub artist: String,
     pub title: String,
     pub album: String,
     pub art_url: String,
+    pub can_go_next: bool,
+    pub can_go_previous: bool,
+    pub can_play: bool,
+    pub can_pause: bool,
+}
+
+impl MediaPlayerState {
+    pub fn key(&self) -> &str {
+        if self.bus_name.is_empty() {
+            &self.player
+        } else {
+            &self.bus_name
+        }
+    }
+
+    pub fn has_metadata(&self) -> bool {
+        !self.title.is_empty() || !self.artist.is_empty() || !self.album.is_empty()
+    }
+
+    pub fn can_toggle_playing(&self) -> bool {
+        self.can_play || self.can_pause
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1186,6 +1231,10 @@ pub struct MediaState {
 
 impl MediaState {
     fn collect() -> Self {
+        match dbus::list_mpris_players() {
+            Ok(players) if !players.is_empty() => return media_state_from_mpris(players),
+            Ok(_) | Err(_) => {}
+        }
         match command(
             "playerctl",
             &[
@@ -1204,6 +1253,49 @@ impl MediaState {
     }
 }
 
+fn media_state_from_mpris(players: Vec<dbus::MprisPlayer>) -> MediaState {
+    let players = players
+        .into_iter()
+        .map(|player| MediaPlayerState {
+            player: if player.identity.is_empty() {
+                player.bus_name.clone()
+            } else {
+                player.identity
+            },
+            bus_name: player.bus_name,
+            desktop_entry: player.desktop_entry,
+            status: player.status,
+            artist: player.artist,
+            title: player.title,
+            album: player.album,
+            art_url: player.art_url,
+            can_go_next: player.can_go_next,
+            can_go_previous: player.can_go_previous,
+            can_play: player.can_play,
+            can_pause: player.can_pause,
+        })
+        .collect::<Vec<_>>();
+    let Some(player) = players
+        .iter()
+        .find(|player| player.status.eq_ignore_ascii_case("playing"))
+        .or_else(|| players.iter().find(|player| player.has_metadata()))
+        .or_else(|| players.first())
+    else {
+        return MediaState::default();
+    };
+    MediaState {
+        available: true,
+        player: player.player.clone(),
+        status: player.status.clone(),
+        artist: player.artist.clone(),
+        title: player.title.clone(),
+        album: player.album.clone(),
+        art_url: player.art_url.clone(),
+        players,
+        error: None,
+    }
+}
+
 pub fn parse_playerctl_metadata(raw: &str) -> MediaState {
     let players = raw
         .lines()
@@ -1212,11 +1304,17 @@ pub fn parse_playerctl_metadata(raw: &str) -> MediaState {
             let fields = line.split('\t').collect::<Vec<_>>();
             MediaPlayerState {
                 player: fields.first().copied().unwrap_or_default().to_string(),
+                bus_name: String::new(),
+                desktop_entry: String::new(),
                 status: fields.get(1).copied().unwrap_or_default().to_string(),
                 artist: fields.get(2).copied().unwrap_or_default().to_string(),
                 title: fields.get(3).copied().unwrap_or_default().to_string(),
                 album: fields.get(4).copied().unwrap_or_default().to_string(),
                 art_url: fields.get(5).copied().unwrap_or_default().to_string(),
+                can_go_next: true,
+                can_go_previous: true,
+                can_play: true,
+                can_pause: true,
             }
         })
         .filter(|player| !player.player.is_empty())

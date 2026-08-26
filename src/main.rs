@@ -1,4 +1,5 @@
 mod config;
+mod dbus;
 mod ipc;
 mod menu;
 mod overlays;
