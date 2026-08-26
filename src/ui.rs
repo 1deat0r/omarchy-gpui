@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::config::{BarEntry, ShellSnapshot};
 use crate::ipc::{IpcEvent, IpcEventReceiver};
-use crate::menu::{MenuItem, MenuItemKind, MenuModel};
+use crate::menu::{DmenuOption, DmenuRequest, MenuItem, MenuItemKind, MenuModel};
 use crate::overlays::{
     OverlayAction, OverlayRow, clipboard_rows_from_path, default_clipboard_history_path,
     emoji_rows_from_path, image_rows_from_payload, parse_image_picker_payload, reminder_args,
@@ -202,6 +202,20 @@ impl ShellView {
         let panel_payload = payload.to_string();
         let panel_snapshot = self.snapshot.clone();
         let fullscreen_overlay = is_fullscreen_overlay(&panel_id);
+        let dmenu_request = (panel_id == "omarchy.menu")
+            .then(|| DmenuRequest::parse(&panel_payload))
+            .flatten();
+        let panel_width = dmenu_request
+            .as_ref()
+            .map(|request| request.width as f32)
+            .unwrap_or(520.0);
+        let panel_height = dmenu_request
+            .as_ref()
+            .and_then(|request| {
+                (request.max_height > 0).then_some(request.max_height as f32 + 140.0)
+            })
+            .unwrap_or(560.0)
+            .clamp(240.0, 800.0);
         let namespace = if fullscreen_overlay {
             format!("omarchy-gpui-{}", panel_id.replace('.', "-"))
         } else {
@@ -215,7 +229,7 @@ impl ShellView {
                     size: if fullscreen_overlay {
                         size(px(0.0), px(0.0))
                     } else {
-                        size(px(520.0), px(560.0))
+                        size(px(panel_width), px(panel_height))
                     },
                 })),
                 app_id: Some("omarchy-gpui-panel".to_string()),
@@ -380,6 +394,7 @@ struct PanelView {
     selected_menu_index: usize,
     overlay_rows: Vec<OverlayRow>,
     overlay_filterable: bool,
+    dmenu: Option<DmenuRequest>,
     qr_meta: String,
     qr_lines: Vec<String>,
     reminder_minutes: String,
@@ -396,6 +411,9 @@ impl PanelView {
         cx: &mut Context<Self>,
     ) -> Self {
         let menu = (id == "omarchy.menu").then(MenuModel::load);
+        let dmenu = (id == "omarchy.menu")
+            .then(|| DmenuRequest::parse(payload))
+            .flatten();
         let (overlay_rows, overlay_filterable) = overlay_rows_for(&id, payload, &snapshot);
         let (qr_meta, qr_lines) = if id == "omarchy.wifiqr" {
             wifi_qr_payload(&snapshot)
@@ -498,6 +516,7 @@ impl PanelView {
             selected_menu_index: 0,
             overlay_rows,
             overlay_filterable,
+            dmenu,
             qr_meta,
             qr_lines,
             reminder_minutes: String::new(),
@@ -1230,6 +1249,116 @@ impl PanelView {
         content
     }
 
+    fn visible_dmenu_options(&mut self) -> Vec<(usize, DmenuOption)> {
+        let Some(request) = self.dmenu.as_ref() else {
+            return Vec::new();
+        };
+        if request.input {
+            return Vec::new();
+        }
+        let query = self.filter_text.trim().to_lowercase();
+        let options = request
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(_, option)| {
+                query.is_empty()
+                    || format!("{} {}", option.label, option.detail)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .map(|(index, option)| (index, option.clone()))
+            .collect::<Vec<_>>();
+        if options.is_empty() {
+            self.selected_menu_index = 0;
+        } else if self.selected_menu_index >= options.len() {
+            self.selected_menu_index = options.len() - 1;
+        }
+        options
+    }
+
+    fn dmenu_content(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(request) = self.dmenu.clone() else {
+            return div();
+        };
+        let mut content = div().flex().flex_col().gap_1().mt_3();
+        content = content.child(
+            div()
+                .id("omarchy-gpui-dmenu-prompt")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x27272a))
+                .text_color(if self.filter_text.is_empty() {
+                    rgb(0x71717a)
+                } else {
+                    rgb(0xf4f4f5)
+                })
+                .child(if self.filter_text.is_empty() {
+                    format!("{}…", request.prompt)
+                } else {
+                    self.filter_text.clone()
+                }),
+        );
+        if request.input {
+            return content.child(
+                div()
+                    .text_color(rgb(0xa1a1aa))
+                    .child("Press Enter to submit, or Esc to cancel."),
+            );
+        }
+
+        let options = self.visible_dmenu_options();
+        let options_empty = options.is_empty();
+        let mut rows = div().flex().flex_col().gap_1();
+        for (visible_index, (index, option)) in options.into_iter().enumerate() {
+            let label = if option.icon.is_empty() {
+                option.label.clone()
+            } else {
+                format!("{}  {}", option.icon, option.label)
+            };
+            let detail = option.detail.clone();
+            rows = rows.child(
+                div()
+                    .id(format!("omarchy-gpui-dmenu-item-{index}"))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if visible_index == self.selected_menu_index {
+                        rgb(0x3f3f46)
+                    } else {
+                        rgb(0x27272a)
+                    })
+                    .border_1()
+                    .border_color(rgb(0x3f3f46))
+                    .child(label)
+                    .when(!detail.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .mt_1()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0xa1a1aa))
+                                .child(detail.clone()),
+                        )
+                    })
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.finish_dmenu(Some(index), window, cx);
+                    })),
+            );
+        }
+        if options_empty {
+            rows = rows.child(
+                div()
+                    .text_color(rgb(0xa1a1aa))
+                    .child("No options available."),
+            );
+        }
+        content.child(rows)
+    }
+
     fn visible_menu_items(&mut self, model: &MenuModel) -> Vec<MenuItem> {
         let active_menu = self.active_menu.clone();
         let items = self
@@ -1250,6 +1379,10 @@ impl PanelView {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dmenu.is_some() {
+            self.handle_dmenu_key(event, window, cx);
+            return;
+        }
         let Some(model) = self.menu.clone() else {
             if self.is_overlay() {
                 self.handle_overlay_key(event, window, cx);
@@ -1323,6 +1456,113 @@ impl PanelView {
         }
     }
 
+    fn handle_dmenu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                self.finish_dmenu(None, window, cx);
+                return;
+            }
+            "backspace" => {
+                if self.filter_text.pop().is_some() {
+                    self.selected_menu_index = 0;
+                    cx.notify();
+                }
+                return;
+            }
+            "up" | "k" => {
+                let count = self.visible_dmenu_options().len();
+                if count > 0 {
+                    self.selected_menu_index = self.selected_menu_index.saturating_sub(1);
+                }
+                cx.notify();
+                return;
+            }
+            "down" | "j" => {
+                let count = self.visible_dmenu_options().len();
+                if count > 0 {
+                    self.selected_menu_index =
+                        (self.selected_menu_index + 1).min(count.saturating_sub(1));
+                }
+                cx.notify();
+                return;
+            }
+            "enter" | "return" => {
+                let request = self.dmenu.clone();
+                if let Some(request) = request {
+                    if request.input {
+                        self.finish_dmenu_value(
+                            request.result_for(None, &self.filter_text),
+                            window,
+                            cx,
+                        );
+                    } else if let Some((_, option)) = self
+                        .visible_dmenu_options()
+                        .get(self.selected_menu_index)
+                        .cloned()
+                    {
+                        self.finish_dmenu_value(request.result_for(Some(&option), ""), window, cx);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+        {
+            return;
+        }
+        if let Some(character) = event
+            .keystroke
+            .key_char
+            .as_deref()
+            .or_else(|| (!key.is_empty() && key.chars().count() == 1).then_some(key))
+            && !character.chars().any(char::is_control)
+        {
+            self.filter_text.push_str(character);
+            self.selected_menu_index = 0;
+            cx.notify();
+        }
+    }
+
+    fn finish_dmenu(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self
+            .dmenu
+            .as_ref()
+            .and_then(|request| index.and_then(|index| request.options.get(index)))
+            .map(DmenuOption::selection_value);
+        self.finish_dmenu_value(value.unwrap_or_default(), window, cx);
+    }
+
+    fn finish_dmenu_value(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(request) = self.dmenu.clone() else {
+            window.remove_window();
+            return;
+        };
+        let result = if request.done_file.trim().is_empty() {
+            Ok(())
+        } else if value.is_empty() {
+            truncate_file(&request.done_file)
+        } else if request.selection_file.trim().is_empty() {
+            truncate_file(&request.done_file)
+        } else {
+            write_text_file(&request.selection_file, &format!("{value}\n"))
+                .and_then(|()| truncate_file(&request.done_file))
+        };
+        match result {
+            Ok(()) => window.remove_window(),
+            Err(error) => self.message = error,
+        }
+        cx.notify();
+    }
+
     fn move_menu_selection(&mut self, delta: i32, model: &MenuModel) {
         let count = self.visible_menu_items(model).len();
         if count == 0 {
@@ -1375,18 +1615,25 @@ impl PanelView {
 impl Render for PanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
-            .menu
+            .dmenu
             .as_ref()
-            .and_then(|menu| menu.item(&self.active_menu))
-            .map(|item| {
-                if item.title.is_empty() {
-                    item.label.clone()
-                } else {
-                    item.title.clone()
-                }
+            .map(|request| request.prompt.clone())
+            .or_else(|| {
+                self.menu
+                    .as_ref()
+                    .and_then(|menu| menu.item(&self.active_menu))
+                    .map(|item| {
+                        if item.title.is_empty() {
+                            item.label.clone()
+                        } else {
+                            item.title.clone()
+                        }
+                    })
             })
             .unwrap_or_else(|| label_for(&self.id).to_string());
-        let content = if self.menu.is_some() {
+        let content = if self.dmenu.is_some() {
+            self.dmenu_content(cx)
+        } else if self.menu.is_some() {
             self.menu_content(cx)
         } else if self.id == "omarchy.wifiqr" {
             self.wifi_qr_content()

@@ -48,6 +48,111 @@ pub enum MenuItemKind {
     Action,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmenuOption {
+    pub icon: String,
+    pub label: String,
+    pub detail: String,
+}
+
+impl DmenuOption {
+    pub fn selection_value(&self) -> String {
+        if self.detail.is_empty() {
+            self.label.clone()
+        } else {
+            format!("{}\t{}", self.label, self.detail)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmenuRequest {
+    pub input: bool,
+    pub prompt: String,
+    pub options: Vec<DmenuOption>,
+    pub selection_file: String,
+    pub done_file: String,
+    pub width: u32,
+    pub max_height: u32,
+}
+
+impl DmenuRequest {
+    pub fn parse(payload: &str) -> Option<Self> {
+        let value = serde_json::from_str::<Value>(payload).ok()?;
+        let mode = value.get("mode").and_then(Value::as_str)?;
+        let input = match mode {
+            "input" => true,
+            "select" => false,
+            _ => return None,
+        };
+        let prompt = value
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or(if input { "Input" } else { "Select" })
+            .to_string();
+        let options = value
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(parse_dmenu_option)
+            .collect();
+        let selection_file = value
+            .get("selectionFile")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let done_file = value
+            .get("doneFile")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let width = positive_u32(value.get("width")).unwrap_or(300);
+        let max_height = positive_u32(value.get("maxHeight")).unwrap_or(0);
+        Some(Self {
+            input,
+            prompt,
+            options,
+            selection_file,
+            done_file,
+            width,
+            max_height,
+        })
+    }
+
+    pub fn result_for(&self, option: Option<&DmenuOption>, input: &str) -> String {
+        if self.input {
+            input.to_string()
+        } else {
+            option.map(DmenuOption::selection_value).unwrap_or_default()
+        }
+    }
+}
+
+fn parse_dmenu_option(raw: &str) -> DmenuOption {
+    let mut fields = raw.split('\t');
+    let first = fields.next().unwrap_or_default();
+    let second = fields.next();
+    let (icon, label) = match second {
+        Some(label) => (first.to_string(), label.to_string()),
+        None => (String::new(), first.to_string()),
+    };
+    DmenuOption {
+        icon,
+        label,
+        detail: fields.collect::<Vec<_>>().join("\t"),
+    }
+}
+
+fn positive_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.min(u32::MAX as f64) as u32)
+}
+
 impl MenuModel {
     pub fn load() -> Self {
         let omarchy = std::env::var_os("OMARCHY_PATH")
@@ -525,7 +630,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{MenuItemKind, MenuModel, parse_desktop_entry, shell_quote, strip_jsonc};
+    use super::{
+        DmenuRequest, MenuItemKind, MenuModel, parse_desktop_entry, shell_quote, strip_jsonc,
+    };
 
     #[test]
     fn parses_comments_trailing_commas_and_dotted_parents() {
@@ -554,6 +661,27 @@ mod tests {
         assert_eq!(model.order, vec!["root", "one", "two", "three"]);
         assert_eq!(model.item("one").unwrap().label, "Updated");
         assert_eq!(model.resolve_route("FIRST"), "one");
+    }
+
+    #[test]
+    fn dmenu_request_preserves_display_fields_and_result_contract() {
+        let request = DmenuRequest::parse(
+            r#"{"mode":"select","prompt":"Format","options":["jpg","🖼\tPNG\tPortable Network Graphics"],"selectionFile":"/tmp/selection","doneFile":"/tmp/done","width":400,"maxHeight":500}"#,
+        )
+        .expect("select request");
+        assert_eq!(request.prompt, "Format");
+        assert_eq!(request.width, 400);
+        assert_eq!(request.max_height, 500);
+        assert_eq!(request.options[0].selection_value(), "jpg");
+        assert_eq!(request.options[1].icon, "🖼");
+        assert_eq!(
+            request.options[1].selection_value(),
+            "PNG\tPortable Network Graphics"
+        );
+
+        let input =
+            DmenuRequest::parse(r#"{"mode":"input","prompt":"Name"}"#).expect("input request");
+        assert_eq!(input.result_for(None, "new name"), "new name");
     }
 
     #[test]
