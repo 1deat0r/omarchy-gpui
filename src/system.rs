@@ -80,6 +80,7 @@ pub enum SystemAction {
         on_battery: bool,
     },
     SetNetworkBand(String),
+    SetNightlight(bool),
     ToggleNightlight,
     BluetoothDevice {
         action: BluetoothDeviceAction,
@@ -183,6 +184,7 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             }
             command("omarchy-network-band", &[band]).map(|_| ())
         }
+        SystemAction::SetNightlight(enabled) => set_nightlight(*enabled),
         SystemAction::ToggleNightlight => command("omarchy-toggle-nightlight", &[]).map(|_| ()),
         SystemAction::BluetoothDevice { action, address } => {
             validate_bluetooth_address(address)?;
@@ -220,6 +222,25 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             command("nmcli", &["device", "wifi", "rescan", "ifname", device]).map(|_| ())
         }
     }
+}
+
+fn set_nightlight(enabled: bool) -> Result<(), String> {
+    if !command_present("hyprsunset") {
+        Command::new("setsid")
+            .args(["uwsm-app", "--", "hyprsunset"])
+            .spawn()
+            .map_err(|error| format!("start hyprsunset: {error}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let temperature = if enabled { "4000" } else { "6500" };
+    command("hyprctl", &["hyprsunset", "temperature", temperature]).map(|_| ())
+}
+
+fn command_present(program: &str) -> bool {
+    Command::new("which")
+        .arg(program)
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 pub fn to_value(snapshot: &SystemSnapshot) -> Value {
@@ -330,6 +351,14 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "status": snapshot.media.status,
             "artist": snapshot.media.artist,
             "title": snapshot.media.title,
+            "players": snapshot.media.players.iter().map(|player| serde_json::json!({
+                "player": player.player,
+                "status": player.status,
+                "artist": player.artist,
+                "title": player.title,
+                "album": player.album,
+                "artUrl": player.art_url,
+            })).collect::<Vec<_>>(),
             "error": snapshot.media.error,
         },
         "display": {
@@ -1086,12 +1115,25 @@ pub fn parse_battery_shell(raw: &str) -> BatteryState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaPlayerState {
+    pub player: String,
+    pub status: String,
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub art_url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaState {
     pub available: bool,
     pub player: String,
     pub status: String,
     pub artist: String,
     pub title: String,
+    pub album: String,
+    pub art_url: String,
+    pub players: Vec<MediaPlayerState>,
     pub error: Option<String>,
 }
 
@@ -1103,7 +1145,7 @@ impl MediaState {
                 "-a",
                 "metadata",
                 "--format",
-                "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}",
+                "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}\t{{album}}\t{{mpris:artUrl}}",
             ],
         ) {
             Ok(raw) => parse_playerctl_metadata(&raw),
@@ -1116,16 +1158,38 @@ impl MediaState {
 }
 
 pub fn parse_playerctl_metadata(raw: &str) -> MediaState {
-    let Some(line) = raw.lines().find(|line| !line.trim().is_empty()) else {
+    let players = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            MediaPlayerState {
+                player: fields.first().copied().unwrap_or_default().to_string(),
+                status: fields.get(1).copied().unwrap_or_default().to_string(),
+                artist: fields.get(2).copied().unwrap_or_default().to_string(),
+                title: fields.get(3).copied().unwrap_or_default().to_string(),
+                album: fields.get(4).copied().unwrap_or_default().to_string(),
+                art_url: fields.get(5).copied().unwrap_or_default().to_string(),
+            }
+        })
+        .filter(|player| !player.player.is_empty())
+        .collect::<Vec<_>>();
+    let Some(player) = players
+        .iter()
+        .find(|player| player.status.eq_ignore_ascii_case("playing"))
+        .or_else(|| players.first())
+    else {
         return MediaState::default();
     };
-    let fields = line.split('\t').collect::<Vec<_>>();
     MediaState {
         available: true,
-        player: fields.first().copied().unwrap_or_default().to_string(),
-        status: fields.get(1).copied().unwrap_or_default().to_string(),
-        artist: fields.get(2).copied().unwrap_or_default().to_string(),
-        title: fields.get(3).copied().unwrap_or_default().to_string(),
+        player: player.player.clone(),
+        status: player.status.clone(),
+        artist: player.artist.clone(),
+        title: player.title.clone(),
+        album: player.album.clone(),
+        art_url: player.art_url.clone(),
+        players,
         error: None,
     }
 }
@@ -1559,10 +1623,15 @@ mod tests {
 
     #[test]
     fn parses_first_media_player() {
-        let parsed = parse_playerctl_metadata("Firefox\tPlaying\tArtist\tTitle\n");
+        let parsed = parse_playerctl_metadata(
+            "Firefox\tPaused\tOld Artist\tOld Title\nVLC\tPlaying\tArtist\tTitle\tAlbum\tfile:///art.png\n",
+        );
         assert!(parsed.available);
+        assert_eq!(parsed.player, "VLC");
         assert_eq!(parsed.status, "Playing");
         assert_eq!(parsed.title, "Title");
+        assert_eq!(parsed.album, "Album");
+        assert_eq!(parsed.players.len(), 2);
     }
 
     #[test]

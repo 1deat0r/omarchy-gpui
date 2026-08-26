@@ -11,7 +11,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::config::ShellSnapshot;
@@ -113,6 +113,8 @@ pub enum IpcEvent {
     Summon { id: String, payload: String },
     Hide { id: String },
     Toggle { id: String, payload: String },
+    Lock { preview: bool },
+    NotificationHistory { entries: String },
 }
 
 pub type IpcEventReceiver = Arc<Mutex<Receiver<IpcEvent>>>;
@@ -125,6 +127,11 @@ struct IpcRuntime {
     dnd_state_path: PathBuf,
     osd_open: bool,
     background_path: String,
+    preferred_media_player: String,
+    lock_requested: bool,
+    lock_preview_visible: bool,
+    lock_last_event: String,
+    lock_last_event_at: String,
 }
 
 impl IpcRuntime {
@@ -139,6 +146,11 @@ impl IpcRuntime {
             dnd_state_path,
             osd_open: false,
             background_path: current_background_path(&home),
+            preferred_media_player: String::new(),
+            lock_requested: false,
+            lock_preview_visible: false,
+            lock_last_event: "init".to_string(),
+            lock_last_event_at: String::new(),
         }
     }
 }
@@ -759,9 +771,48 @@ fn dispatch_call(
                 None,
             ))
         }
-        ("omarchy.notifications", "clear" | "dismissAll") => Ok(outcome("ok", None)),
-        ("omarchy.notifications", "dismissOne" | "invokeLast" | "dismiss" | "showHistory") => {
-            Ok(outcome("none", None))
+        ("omarchy.notifications", "clear") => {
+            clear_notification_history(&home_from_config_path(&runtime.snapshot.user_config_path))?;
+            Ok(outcome("ok", None))
+        }
+        ("omarchy.notifications", "dismissAll") => {
+            clear_live_notifications(&home_from_config_path(&runtime.snapshot.user_config_path))?;
+            Ok(outcome("ok", None))
+        }
+        ("omarchy.notifications", "dismissOne") => {
+            let home = home_from_config_path(&runtime.snapshot.user_config_path);
+            let output = if remove_latest_live_notification(&home)? {
+                "ok"
+            } else {
+                "none"
+            };
+            Ok(outcome(output, None))
+        }
+        ("omarchy.notifications", "invokeLast") => {
+            let home = home_from_config_path(&runtime.snapshot.user_config_path);
+            let output = if invoke_latest_live_notification(&home)? {
+                "ok"
+            } else {
+                "none"
+            };
+            Ok(outcome(output, None))
+        }
+        ("omarchy.notifications", "dismiss") => {
+            let summary = required_call_arg(args, 0, "notification summary")?;
+            let removed = dismiss_notifications_matching(
+                &home_from_config_path(&runtime.snapshot.user_config_path),
+                summary,
+            )?;
+            Ok(outcome(if removed { "ok" } else { "none" }, None))
+        }
+        ("omarchy.notifications", "showHistory") => {
+            let entries = read_notification_history(&home_from_config_path(
+                &runtime.snapshot.user_config_path,
+            ))?;
+            Ok(outcome(
+                "ok",
+                Some(IpcEvent::NotificationHistory { entries }),
+            ))
         }
         ("omarchy.notifications", "ping") => Ok(outcome("ok", None)),
         ("omarchy.menu", "ping") => Ok(outcome("ok", None)),
@@ -866,19 +917,50 @@ fn dispatch_call(
 
         ("omarchy.media", "status") => {
             let media = SystemSnapshot::collect().media;
+            let selected = if runtime.preferred_media_player.is_empty() {
+                media
+                    .players
+                    .iter()
+                    .find(|player| player.player == media.player)
+                    .or_else(|| media.players.first())
+            } else {
+                media
+                    .players
+                    .iter()
+                    .find(|player| player.player == runtime.preferred_media_player)
+                    .or_else(|| media.players.first())
+            };
+            let player = selected
+                .map(|player| player.player.as_str())
+                .unwrap_or_default();
+            let status = selected
+                .map(|player| player.status.as_str())
+                .unwrap_or_default();
+            let artist = selected
+                .map(|player| player.artist.as_str())
+                .unwrap_or_default();
+            let title = selected
+                .map(|player| player.title.as_str())
+                .unwrap_or_default();
+            let album = selected
+                .map(|player| player.album.as_str())
+                .unwrap_or_default();
+            let art_url = selected
+                .map(|player| player.art_url.as_str())
+                .unwrap_or_default();
             let value = serde_json::json!({
-                "hasPlayer": media.available,
-                "hasMedia": !media.title.is_empty() || !media.artist.is_empty(),
-                "playing": media.status.eq_ignore_ascii_case("playing"),
-                "identity": media.player,
+                "hasPlayer": selected.is_some(),
+                "hasMedia": !title.is_empty() || !artist.is_empty(),
+                "playing": status.eq_ignore_ascii_case("playing"),
+                "identity": player,
                 "desktopEntry": "",
-                "title": media.title,
-                "artist": media.artist,
-                "album": "",
-                "artUrl": "",
-                "canGoNext": media.available,
-                "canGoPrevious": media.available,
-                "canTogglePlaying": media.available,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "artUrl": art_url,
+                "canGoNext": selected.is_some(),
+                "canGoPrevious": selected.is_some(),
+                "canTogglePlaying": selected.is_some(),
             });
             Ok(outcome(&value.to_string(), None))
         }
@@ -890,29 +972,68 @@ fn dispatch_call(
         (
             "omarchy.media",
             "sourceNext" | "sourcePrevious" | "sourceSwitch" | "sourceSwitchPrevious",
-        ) => Ok(outcome("unhandled", None)),
+        ) => {
+            let media = SystemSnapshot::collect().media;
+            let current = if runtime.preferred_media_player.is_empty() {
+                media.player.as_str()
+            } else {
+                runtime.preferred_media_player.as_str()
+            };
+            let delta = if matches!(method, "sourcePrevious" | "sourceSwitchPrevious") {
+                -1
+            } else {
+                1
+            };
+            let mut candidates = media
+                .players
+                .iter()
+                .filter(|player| {
+                    !player.player.is_empty()
+                        && (!player.title.is_empty()
+                            || !player.artist.is_empty()
+                            || player.status.eq_ignore_ascii_case("playing"))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| left.player.cmp(&right.player));
+            if candidates.is_empty() {
+                Ok(outcome("unhandled", None))
+            } else {
+                let current_index = candidates
+                    .iter()
+                    .position(|player| player.player == current)
+                    .unwrap_or(0);
+                let next_index =
+                    (current_index as isize + delta).rem_euclid(candidates.len() as isize) as usize;
+                let next = candidates[next_index];
+                let transfer = matches!(method, "sourceSwitch" | "sourceSwitchPrevious");
+                if transfer
+                    && next.player != current
+                    && media
+                        .players
+                        .iter()
+                        .find(|player| player.player == current)
+                        .is_some_and(|player| player.status.eq_ignore_ascii_case("playing"))
+                {
+                    if media_player_action(&next.player, "play").is_err() {
+                        return Ok(outcome("unhandled", None));
+                    }
+                    let _ = media_player_action(current, "pause");
+                }
+                runtime.preferred_media_player = next.player.clone();
+                Ok(outcome("ok", None))
+            }
+        }
         ("omarchy.media", "ping") => Ok(outcome("ok", None)),
 
-        ("omarchy.nightlight", "status") => {
-            let nightlight = SystemSnapshot::collect().nightlight;
-            let value = serde_json::json!({
-                "enabled": nightlight.active,
-                "temperature": nightlight.temperature,
-            });
-            Ok(outcome(&value.to_string(), None))
-        }
+        ("omarchy.nightlight", "status") => Ok(outcome(&nightlight_status_json(), None)),
         ("omarchy.nightlight", "enable" | "disable" | "toggle") => {
-            let current = SystemSnapshot::collect().nightlight.active;
+            let current = nightlight_enabled();
             let enabling = match method {
                 "enable" => true,
                 "disable" => false,
-                _ => !current,
+                _ => !current.unwrap_or(false),
             };
-            let result = if enabling == current {
-                Ok(())
-            } else {
-                run_action(&SystemAction::ToggleNightlight)
-            };
+            let result = run_action(&SystemAction::SetNightlight(enabling));
             match result {
                 Ok(()) => Ok(outcome(if enabling { "enabled" } else { "disabled" }, None)),
                 Err(_) => Ok(outcome("error", None)),
@@ -937,26 +1058,53 @@ fn dispatch_call(
             }
         }
 
-        ("omarchy.lock", "isLocked") => Ok(outcome("false", None)),
-        ("omarchy.lock", "status") => Ok(outcome(
-            &serde_json::json!({
-                "locked": false,
-                "requested": false,
-                "pending": false,
-                "sessionLocked": false,
-                "secure": false,
-                "realScreens": 0,
-                "passwordPam": false,
-                "fingerprint": false,
-                "authenticating": false,
-                "lastEvent": "",
-                "lastEventAt": 0,
-            })
-            .to_string(),
-            None,
-        )),
-        ("omarchy.lock", "preview" | "hidePreview") => Ok(outcome("ok", None)),
-        ("omarchy.lock", "lock") => Ok(outcome("failed", None)),
+        ("omarchy.lock", "isLocked") => {
+            let status = lock_status(runtime);
+            Ok(outcome(
+                if status.get("locked").and_then(serde_json::Value::as_bool) == Some(true) {
+                    "true"
+                } else {
+                    "false"
+                },
+                None,
+            ))
+        }
+        ("omarchy.lock", "status") => Ok(outcome(&lock_status(runtime).to_string(), None)),
+        ("omarchy.lock", "preview") => {
+            runtime.lock_preview_visible = true;
+            record_lock_event(runtime, "preview");
+            Ok(outcome("ok", Some(IpcEvent::Lock { preview: true })))
+        }
+        ("omarchy.lock", "hidePreview") => {
+            runtime.lock_preview_visible = false;
+            record_lock_event(runtime, "preview-hidden");
+            Ok(outcome("ok", Some(IpcEvent::Lock { preview: false })))
+        }
+        ("omarchy.lock", "lock") => {
+            if !password_pam_configured() {
+                record_lock_event(runtime, "lock-denied: missing-pam");
+                Ok(outcome("missing-pam", None))
+            } else if lock_status(runtime)
+                .get("locked")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                Ok(outcome("ok", None))
+            } else if !command_present("loginctl") {
+                record_lock_event(runtime, "lock-failed: loginctl-missing");
+                Ok(outcome("failed", None))
+            } else {
+                let result = Command::new("loginctl").arg("lock-session").output();
+                if result.is_ok_and(|output| output.status.success()) {
+                    runtime.lock_requested = true;
+                    record_lock_event(runtime, "lock-requested");
+                    Ok(outcome("ok", Some(IpcEvent::Lock { preview: false })))
+                } else {
+                    record_lock_event(runtime, "lock-failed");
+                    Ok(outcome("failed", None))
+                }
+            }
+        }
 
         ("omarchy.dropbox", "status") => Ok(outcome(
             &live_dropbox_status(&runtime.snapshot.omarchy_path),
@@ -1233,6 +1381,331 @@ fn media_action(action: SystemAction) -> Result<CommandOutcome, String> {
         },
         None,
     ))
+}
+
+fn media_player_action(player: &str, action: &str) -> Result<(), String> {
+    validate_ipc_argument(player, "media player")?;
+    if !matches!(action, "play" | "pause" | "play-pause") {
+        return Err("invalid media action".to_string());
+    }
+    command_output("playerctl", &["--player", player, action]).map(|_| ())
+}
+
+fn validate_ipc_argument(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        Err(format!("invalid {label}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn nightlight_status_json() -> String {
+    if let Ok(raw) = command_output("omarchy-toggle-nightlight", &["--status"])
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+        && value.is_object()
+    {
+        return value.to_string();
+    }
+    let nightlight = SystemSnapshot::collect().nightlight;
+    serde_json::json!({
+        "enabled": nightlight.active,
+        "temperature": nightlight.temperature,
+    })
+    .to_string()
+}
+
+fn nightlight_enabled() -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(&nightlight_status_json())
+        .ok()
+        .and_then(|value| value.get("enabled").and_then(serde_json::Value::as_bool))
+}
+
+fn lock_status(runtime: &IpcRuntime) -> serde_json::Value {
+    let session_locked = session_is_locked();
+    let real_screens = real_screen_count();
+    let password_pam = password_pam_configured();
+    let fingerprint = fingerprint_configured();
+    serde_json::json!({
+        "locked": runtime.lock_requested || session_locked,
+        "requested": runtime.lock_requested,
+        "pending": runtime.lock_requested && !session_locked,
+        "sessionLocked": session_locked,
+        "secure": session_locked,
+        "realScreens": real_screens,
+        "passwordPam": password_pam,
+        "fingerprint": fingerprint,
+        "authenticating": false,
+        "lastEvent": runtime.lock_last_event,
+        "lastEventAt": runtime.lock_last_event_at,
+        "preview": runtime.lock_preview_visible,
+    })
+}
+
+fn record_lock_event(runtime: &mut IpcRuntime, event: &str) {
+    runtime.lock_last_event = event.to_string();
+    runtime.lock_last_event_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+}
+
+fn session_is_locked() -> bool {
+    if let Some(session) = std::env::var_os("XDG_SESSION_ID").filter(|value| !value.is_empty())
+        && let Ok(output) = Command::new("loginctl")
+            .args([
+                "show-session",
+                &session.to_string_lossy(),
+                "-p",
+                "LockedHint",
+                "--value",
+            ])
+            .output()
+        && output.status.success()
+    {
+        let value = String::from_utf8_lossy(&output.stdout);
+        return parse_bool_arg(value.trim());
+    }
+    Command::new("omarchy-hyprland-session-locked")
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn real_screen_count() -> usize {
+    let Ok(raw) = command_output("hyprctl", &["-j", "monitors"]) else {
+        return 0;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .map(|monitors| {
+            monitors
+                .iter()
+                .filter(|monitor| {
+                    monitor
+                        .get("width")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0)
+                        > 0
+                        && monitor
+                            .get("height")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0)
+                            > 0
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn password_pam_configured() -> bool {
+    pam_configured_at(Path::new("/etc/pam.d/omarchy-lock-password"))
+}
+
+fn pam_configured_at(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && fs::read(path).is_ok_and(|contents| !contents.is_empty())
+}
+
+fn fingerprint_configured() -> bool {
+    let path = Path::new("/etc/pam.d/omarchy-lock-fingerprint");
+    if !pam_configured_at(path) || !command_present("fprintd-list") {
+        return false;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    if user.is_empty() {
+        return false;
+    }
+    Command::new("fprintd-list")
+        .arg(&user)
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .to_ascii_lowercase()
+                    .contains("finger")
+        })
+}
+
+fn notifications_dir(home: &Path) -> PathBuf {
+    home.join(".local/state/omarchy/notifications")
+}
+
+fn notification_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "read notifications {}: {error}",
+                directory.display()
+            ));
+        }
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
+fn read_notification_history(home: &Path) -> Result<String, String> {
+    let directory = notifications_dir(home).join("history");
+    let mut values = notification_files(&directory)?
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .collect::<Vec<_>>();
+    values.reverse();
+    Ok(serde_json::Value::Array(values).to_string())
+}
+
+fn clear_notification_history(home: &Path) -> Result<(), String> {
+    let history = notifications_dir(home).join("history");
+    let images = notifications_dir(home).join("images");
+    for path in notification_files(&history)? {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        fs::remove_file(&path).map_err(|error| format!("remove notification history: {error}"))?;
+        remove_notification_images(&images, stem)?;
+    }
+    Ok(())
+}
+
+fn clear_live_notifications(home: &Path) -> Result<(), String> {
+    let directory = notifications_dir(home);
+    let images = directory.join("images");
+    for path in notification_files(&directory)? {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        fs::remove_file(&path).map_err(|error| format!("remove live notification: {error}"))?;
+        remove_notification_images(&images, stem)?;
+    }
+    Ok(())
+}
+
+fn remove_latest_live_notification(home: &Path) -> Result<bool, String> {
+    let directory = notifications_dir(home);
+    let Some(path) = notification_files(&directory)?.into_iter().next_back() else {
+        return Ok(false);
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    fs::remove_file(&path).map_err(|error| format!("remove live notification: {error}"))?;
+    remove_notification_images(&directory.join("images"), stem)?;
+    Ok(true)
+}
+
+fn invoke_latest_live_notification(home: &Path) -> Result<bool, String> {
+    let directory = notifications_dir(home);
+    let Some(path) = notification_files(&directory)?.into_iter().next_back() else {
+        return Ok(false);
+    };
+    let value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_default();
+    let invoked = value
+        .get("execArgv")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_exec_argv)
+        .is_some_and(|argv| spawn_argv(&argv).is_ok());
+    if !invoked
+        && let Some(app) = value.get("app").and_then(serde_json::Value::as_str)
+        && !app.is_empty()
+    {
+        let _ = Command::new("omarchy-hyprland-focus-app").arg(app).spawn();
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    fs::remove_file(&path).map_err(|error| format!("remove invoked notification: {error}"))?;
+    remove_notification_images(&directory.join("images"), stem)?;
+    Ok(true)
+}
+
+fn dismiss_notifications_matching(home: &Path, needle: &str) -> Result<bool, String> {
+    let directory = notifications_dir(home);
+    let images = directory.join("images");
+    let mut removed = false;
+    for path in notification_files(&directory)? {
+        let Some(summary) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        else {
+            continue;
+        };
+        if summary.contains(needle) {
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            fs::remove_file(&path).map_err(|error| format!("remove notification: {error}"))?;
+            remove_notification_images(&images, stem)?;
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_notification_images(images: &Path, stem: &str) -> Result<(), String> {
+    if stem.is_empty() {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(images) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with(&format!("{stem}-")))
+        {
+            fs::remove_file(path).map_err(|error| format!("remove notification image: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_exec_argv(raw: &str) -> Option<Vec<String>> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let argv = value
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    let program = argv.first()?;
+    (!program.is_empty() && !program.starts_with('-') && !program.chars().any(char::is_control))
+        .then_some(argv)
+}
+
+fn spawn_argv(argv: &[String]) -> Result<(), String> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "empty notification action".to_string())?;
+    Command::new(program)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("notification action: {error}"))
 }
 
 fn outcome(output: &str, event: Option<IpcEvent>) -> CommandOutcome {
@@ -1536,8 +2009,9 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        IpcEvent, IpcRuntime, ShellCommand, dispatch_runtime, load_dnd_state, parse,
-        persist_dnd_state,
+        IpcEvent, IpcRuntime, ShellCommand, clear_live_notifications, clear_notification_history,
+        dismiss_notifications_matching, dispatch_runtime, load_dnd_state, parse, parse_exec_argv,
+        persist_dnd_state, read_notification_history,
     };
     use crate::config::ShellSnapshot;
 
@@ -1641,6 +2115,61 @@ mod tests {
                 .contains("\"dnd\":false")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn notification_history_and_live_actions_use_reference_state_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-gpui-notifications-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let live = root.join("home/.local/state/omarchy/notifications");
+        let history = live.join("history");
+        fs::create_dir_all(&history).expect("create notification fixture");
+        fs::write(
+            history.join("100-1.json"),
+            r#"{"summary":"older","body":"one"}"#,
+        )
+        .expect("write old notification");
+        fs::write(
+            history.join("200-2.json"),
+            r#"{"summary":"newer","body":"two"}"#,
+        )
+        .expect("write new notification");
+        fs::write(
+            live.join("300-3.json"),
+            r#"{"summary":"live","body":"three"}"#,
+        )
+        .expect("write live notification");
+
+        let history_json: serde_json::Value =
+            serde_json::from_str(&read_notification_history(&root.join("home")).unwrap())
+                .expect("parse history");
+        assert_eq!(history_json[0]["summary"], "newer");
+        assert_eq!(history_json[1]["summary"], "older");
+        assert!(dismiss_notifications_matching(&root.join("home"), "live").unwrap());
+        assert!(!live.join("300-3.json").exists());
+
+        fs::write(live.join("400-4.json"), r#"{"summary":"another live"}"#)
+            .expect("write second live notification");
+        clear_live_notifications(&root.join("home")).expect("clear live notifications");
+        assert!(!live.join("400-4.json").exists());
+        clear_notification_history(&root.join("home")).expect("clear notification history");
+        assert!(!history.join("100-1.json").exists());
+        assert!(!history.join("200-2.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn notification_exec_argv_is_structurally_validated() {
+        assert_eq!(
+            parse_exec_argv(r#"["notify-send","hello"]"#),
+            Some(vec!["notify-send".to_string(), "hello".to_string()])
+        );
+        assert!(parse_exec_argv(r#"[]"#).is_none());
+        assert!(parse_exec_argv(r#"["-c","unsafe"]"#).is_none());
+        assert!(parse_exec_argv(r#"["notify-send",3]"#).is_none());
     }
 
     #[test]

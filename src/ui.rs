@@ -325,6 +325,11 @@ impl ShellView {
                     }
                 }
             }
+            IpcEvent::Lock { .. } => {}
+            IpcEvent::NotificationHistory { entries } => {
+                self.close_panel(cx);
+                self.open_panel("omarchy.notifications", &entries, cx);
+            }
         }
     }
 
@@ -1790,6 +1795,7 @@ fn is_panel_capable(id: &str) -> bool {
             | "omarchy.weather"
             | "omarchy.wifiqr"
             | "omarchy.media"
+            | "omarchy.notifications"
     )
 }
 
