@@ -9,7 +9,7 @@ license = "MIT"
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8", package = "gpui", default-features = false, features = ["wayland"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8", package = "gpui_platform", default-features = false, features = ["wayland"] }
 libc = "0.2"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.dev]
 opt-level = 1

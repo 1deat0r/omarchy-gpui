@@ -5,7 +5,12 @@
 //! reference menu model, and merges the user extension over the default
 //! item-by-item.
 
-use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 use serde_json::Value;
 
@@ -122,6 +127,20 @@ impl MenuModel {
             .collect()
     }
 
+    pub fn children_with_providers(&self, parent: &str) -> Vec<MenuItem> {
+        let mut children = self.children(parent);
+        let Some(provider) = self.item(parent).map(|item| item.provider.as_str()) else {
+            return children;
+        };
+        let mut provided = match provider {
+            "apps" => discover_desktop_entries(),
+            "fonts" => discover_fonts(),
+            _ => Vec::new(),
+        };
+        children.append(&mut provided);
+        children
+    }
+
     pub fn parent(&self, id: &str) -> Option<String> {
         self.item(id)
             .map(|item| item.parent.clone())
@@ -132,15 +151,14 @@ impl MenuModel {
         if action.trim().is_empty() {
             return Ok(());
         }
-        let status = Command::new("bash")
+        Command::new("bash")
             .args(["-lc", action])
-            .status()
-            .map_err(|error| format!("menu action: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("menu action exited with {status}"))
-        }
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("menu action: {error}"))
     }
 
     pub fn evaluate_guard(guard: &str) -> bool {
@@ -250,6 +268,164 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
     }
 }
 
+fn discover_desktop_entries() -> Vec<MenuItem> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let data_dirs = env::var_os("XDG_DATA_DIRS")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+
+    let mut by_id = BTreeMap::new();
+    let mut roots = vec![data_home.join("applications")];
+    roots.extend(
+        data_dirs
+            .split(':')
+            .filter(|directory| !directory.is_empty())
+            .map(|directory| PathBuf::from(directory).join("applications")),
+    );
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(item) = parse_desktop_entry(&path) else {
+                continue;
+            };
+            by_id.entry(item.id.clone()).or_insert(item);
+        }
+    }
+
+    let mut items = by_id.into_values().collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.label
+            .to_lowercase()
+            .cmp(&right.label.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    items
+}
+
+fn parse_desktop_entry(path: &Path) -> Option<MenuItem> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("desktop") {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let mut in_desktop_entry = false;
+    let mut fields = BTreeMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        fields.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    if fields
+        .get("Type")
+        .is_some_and(|value| value != "Application")
+        || fields
+            .get("Hidden")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        || fields
+            .get("NoDisplay")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return None;
+    }
+    let label = fields.get("Name")?.clone();
+    if label.is_empty() {
+        return None;
+    }
+    let id = path.file_stem()?.to_str()?.to_string();
+    let mut aliases = fields
+        .get("Keywords")
+        .into_iter()
+        .flat_map(|keywords| keywords.split(';'))
+        .filter(|keyword| !keyword.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(generic_name) = fields.get("GenericName")
+        && !generic_name.is_empty()
+    {
+        aliases.push(generic_name.clone());
+    }
+    Some(MenuItem {
+        id: format!("apps.{id}"),
+        parent: "apps".to_string(),
+        kind: MenuItemKind::Action,
+        label: label.clone(),
+        description: fields.get("Comment").cloned().unwrap_or_default(),
+        action: format!(
+            "uwsm-app -- gtk-launch {}",
+            shell_quote(&format!("{id}.desktop"))
+        ),
+        aliases,
+        ..Default::default()
+    })
+}
+
+fn discover_fonts() -> Vec<MenuItem> {
+    let Ok(raw) = Command::new("omarchy-font-list").output() else {
+        return Vec::new();
+    };
+    if !raw.status.success() {
+        return Vec::new();
+    }
+    let current = Command::new("omarchy-font-current")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    String::from_utf8_lossy(&raw.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|font| !font.is_empty())
+        .map(|font| MenuItem {
+            id: format!("style.font.{}", slugify(font)),
+            parent: "style.font".to_string(),
+            kind: MenuItemKind::Action,
+            icon: "".to_string(),
+            label: font.to_string(),
+            action: format!("omarchy-font-set {}", shell_quote(font)),
+            checked: if current == font {
+                "true".to_string()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn normalize_route(value: &str) -> String {
     value.trim().to_lowercase().replace('_', "-")
 }
@@ -344,7 +520,12 @@ fn strip_trailing_commas(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MenuItemKind, MenuModel, strip_jsonc};
+    use std::{
+        env, fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{MenuItemKind, MenuModel, parse_desktop_entry, shell_quote, strip_jsonc};
 
     #[test]
     fn parses_comments_trailing_commas_and_dotted_parents() {
@@ -379,5 +560,79 @@ mod tests {
     fn comments_inside_strings_survive() {
         let stripped = strip_jsonc(r#"{"url":"https://example.test/a//b"}// end"#);
         assert!(stripped.contains("https://example.test/a//b"));
+    }
+
+    #[test]
+    fn preserves_source_order_for_root_menu_entries() {
+        let model = MenuModel::from_sources(
+            r#"{"zeta":{"label":"Zeta"},"alpha":{"label":"Alpha"},"middle":{"label":"Middle"}}"#,
+            "",
+        );
+        assert_eq!(
+            model
+                .children("root")
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha", "middle"]
+        );
+    }
+
+    #[test]
+    fn parses_desktop_application_metadata_and_builds_safe_launcher() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let directory =
+            env::temp_dir().join(format!("omarchy-gpui-menu-{}-{suffix}", std::process::id()));
+        fs::create_dir(&directory).expect("create desktop fixture directory");
+        let path = directory.join("example.desktop");
+        fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Example App\nGenericName=Demo\nKeywords=alpha;beta;\nComment=Example description\nExec=ignored %U\n",
+        )
+        .expect("write desktop fixture");
+
+        let item = parse_desktop_entry(&path).expect("parse desktop fixture");
+        assert_eq!(item.id, "apps.example");
+        assert_eq!(item.parent, "apps");
+        assert_eq!(item.label, "Example App");
+        assert_eq!(item.description, "Example description");
+        assert_eq!(item.aliases, vec!["alpha", "beta", "Demo"]);
+        assert_eq!(item.action, "uwsm-app -- gtk-launch 'example.desktop'");
+        fs::remove_dir_all(directory).expect("remove desktop fixture directory");
+    }
+
+    #[test]
+    fn ignores_hidden_and_non_application_desktop_entries() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let hidden = env::temp_dir().join(format!(
+            "omarchy-gpui-menu-hidden-{}-{suffix}.desktop",
+            std::process::id()
+        ));
+        fs::write(
+            &hidden,
+            "[Desktop Entry]\nType=Application\nName=Hidden\nHidden=true\n",
+        )
+        .expect("write hidden fixture");
+        assert!(parse_desktop_entry(&hidden).is_none());
+        fs::remove_file(hidden).expect("remove hidden fixture");
+
+        let link = env::temp_dir().join(format!(
+            "omarchy-gpui-menu-link-{}-{suffix}.desktop",
+            std::process::id()
+        ));
+        fs::write(&link, "[Desktop Entry]\nType=Link\nName=Link\n").expect("write link fixture");
+        assert!(parse_desktop_entry(&link).is_none());
+        fs::remove_file(link).expect("remove link fixture");
+    }
+
+    #[test]
+    fn quotes_shell_values_without_interpreting_single_quotes() {
+        assert_eq!(shell_quote("font 'special'"), "'font '\\''special'\\'''");
     }
 }

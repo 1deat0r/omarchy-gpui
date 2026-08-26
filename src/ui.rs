@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -281,6 +282,7 @@ struct PanelView {
     message: String,
     menu: Option<MenuModel>,
     active_menu: String,
+    menu_children: BTreeMap<String, Vec<MenuItem>>,
 }
 
 impl PanelView {
@@ -308,6 +310,7 @@ impl PanelView {
             message: String::new(),
             menu,
             active_menu,
+            menu_children: BTreeMap::new(),
         }
     }
 
@@ -386,12 +389,15 @@ impl PanelView {
     }
 
     fn menu_content(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(model) = self.menu.as_ref() else {
+        let Some(model) = self.menu.clone() else {
             return div();
         };
         let active_menu = self.active_menu.clone();
-        let items = model
-            .children(&active_menu)
+        let items = self
+            .menu_children
+            .entry(active_menu.clone())
+            .or_insert_with(|| model.children_with_providers(&active_menu))
+            .clone()
             .into_iter()
             .filter(|item| MenuModel::evaluate_guard(&item.when))
             .collect::<Vec<_>>();
@@ -451,7 +457,16 @@ impl PanelView {
     }
 
     fn activate_menu_item(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.menu.as_ref().and_then(|menu| menu.item(id)).cloned() else {
+        let item = self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.item(id).cloned())
+            .or_else(|| {
+                self.menu_children
+                    .get(&self.active_menu)
+                    .and_then(|items| items.iter().find(|item| item.id == id).cloned())
+            });
+        let Some(item) = item else {
             self.message = format!("Unknown menu item: {id}");
             cx.notify();
             return;
