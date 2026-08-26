@@ -1,5 +1,6 @@
 mod config;
 mod ipc;
+mod menu;
 mod system;
 mod ui;
 
@@ -21,6 +22,7 @@ fn main() {
         Some("--help") | Some("-h") => print_help(),
         Some("--print-contract") => print_contract(&snapshot),
         Some("--print-system") => print_system(),
+        Some("--print-menu") => print_menu(),
         Some("--smoke") => run_shell(snapshot, true),
         Some("shell") => match ipc::parse(&args) {
             Ok(command) => {
@@ -70,6 +72,14 @@ fn print_system() {
     let system = system::SystemSnapshot::collect();
     println!("system={}", system::to_value(&system));
     println!("OMARCHY_GPUI_SYSTEM_RUNTIME_OK");
+}
+
+fn print_menu() {
+    let menu = menu::MenuModel::load();
+    println!("menu_items={}", menu.items.len());
+    println!("menu_root_children={}", menu.children("root").len());
+    println!("menu_power_route={}", menu.resolve_route("power-menu"));
+    println!("OMARCHY_GPUI_MENU_RUNTIME_OK");
 }
 
 fn print_contract(snapshot: &ShellSnapshot) {

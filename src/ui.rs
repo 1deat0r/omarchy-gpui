@@ -11,6 +11,7 @@ use gpui::{
 
 use crate::config::{BarEntry, ShellSnapshot};
 use crate::ipc::{IpcEvent, IpcEventReceiver};
+use crate::menu::{MenuItem, MenuItemKind, MenuModel};
 use crate::system::{SystemAction, SystemSnapshot, run_action};
 
 pub struct ShellView {
@@ -141,12 +142,13 @@ impl ShellView {
             return;
         }
         self.close_panel(cx);
-        self.open_panel(id, cx);
+        self.open_panel(id, "{}", cx);
     }
 
-    fn open_panel(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn open_panel(&mut self, id: &str, payload: &str, cx: &mut Context<Self>) {
         let panel_id = id.to_string();
         let panel_state = self.system.clone();
+        let panel_payload = payload.to_string();
         let Ok(handle) = cx.open_window(
             WindowOptions {
                 titlebar: None,
@@ -169,7 +171,7 @@ impl ShellView {
                 is_resizable: false,
                 ..Default::default()
             },
-            move |_, cx| cx.new(|_| PanelView::new(panel_id.clone(), panel_state)),
+            move |_, cx| cx.new(|_| PanelView::new(panel_id.clone(), panel_state, &panel_payload)),
         ) else {
             return;
         };
@@ -188,10 +190,10 @@ impl ShellView {
     fn apply_ipc_event(&mut self, event: IpcEvent, cx: &mut Context<Self>) {
         match event {
             IpcEvent::Refresh => {}
-            IpcEvent::Summon { id, .. } => {
+            IpcEvent::Summon { id, payload } => {
                 if is_panel_capable(&id) {
                     self.close_panel(cx);
-                    self.open_panel(&id, cx);
+                    self.open_panel(&id, &payload, cx);
                 }
             }
             IpcEvent::Hide { id } => {
@@ -199,9 +201,14 @@ impl ShellView {
                     self.close_panel(cx);
                 }
             }
-            IpcEvent::Toggle { id, .. } => {
+            IpcEvent::Toggle { id, payload } => {
                 if is_panel_capable(&id) {
-                    self.toggle_panel(&id, cx);
+                    if self.panel_id.as_deref() == Some(id.as_str()) {
+                        self.close_panel(cx);
+                    } else {
+                        self.close_panel(cx);
+                        self.open_panel(&id, &payload, cx);
+                    }
                 }
             }
         }
@@ -272,14 +279,35 @@ struct PanelView {
     id: String,
     system: SystemSnapshot,
     message: String,
+    menu: Option<MenuModel>,
+    active_menu: String,
 }
 
 impl PanelView {
-    fn new(id: String, system: SystemSnapshot) -> Self {
+    fn new(id: String, system: SystemSnapshot, payload: &str) -> Self {
+        let menu = (id == "omarchy.menu").then(MenuModel::load);
+        let active_menu = menu
+            .as_ref()
+            .and_then(|_| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .and_then(|payload| {
+                payload
+                    .get("initialMenu")
+                    .or_else(|| payload.get("menu"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .map(|route| {
+                menu.as_ref()
+                    .map(|model| model.resolve_route(&route))
+                    .unwrap_or_else(|| "root".to_string())
+            })
+            .unwrap_or_else(|| "root".to_string());
         Self {
             id,
             system,
             message: String::new(),
+            menu,
+            active_menu,
         }
     }
 
@@ -356,22 +384,129 @@ impl PanelView {
         }
         actions
     }
+
+    fn menu_content(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(model) = self.menu.as_ref() else {
+            return div();
+        };
+        let active_menu = self.active_menu.clone();
+        let items = model
+            .children(&active_menu)
+            .into_iter()
+            .filter(|item| MenuModel::evaluate_guard(&item.when))
+            .collect::<Vec<_>>();
+        let mut content = div().flex().flex_col().gap_1().mt_3();
+
+        if active_menu != "root" {
+            let parent = model
+                .parent(&active_menu)
+                .unwrap_or_else(|| "root".to_string());
+            content = content.child(
+                div()
+                    .id("omarchy-gpui-menu-back")
+                    .cursor_pointer()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(0x27272a))
+                    .child("‹ Back")
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.active_menu = parent.clone();
+                        cx.notify();
+                    })),
+            );
+        }
+
+        for item in items {
+            let item_id = item.id.clone();
+            let label = menu_label(&item);
+            let description = item.description.clone();
+            let row = div()
+                .id(format!("omarchy-gpui-menu-item-{item_id}"))
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x27272a))
+                .border_1()
+                .border_color(rgb(0x3f3f46))
+                .child(label)
+                .when(!description.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .mt_1()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xa1a1aa))
+                            .child(description.clone()),
+                    )
+                })
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.activate_menu_item(&item_id, window, cx);
+                }));
+            content = content.child(row);
+        }
+        content
+    }
+
+    fn activate_menu_item(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.menu.as_ref().and_then(|menu| menu.item(id)).cloned() else {
+            self.message = format!("Unknown menu item: {id}");
+            cx.notify();
+            return;
+        };
+        match item.kind {
+            MenuItemKind::Menu => {
+                self.active_menu = item.id;
+            }
+            MenuItemKind::Link => {
+                self.active_menu = item.target;
+            }
+            MenuItemKind::Action => match MenuModel::run_action(&item.action) {
+                Ok(()) => {
+                    window.remove_window();
+                }
+                Err(error) => {
+                    self.message = error;
+                }
+            },
+        }
+        cx.notify();
+    }
 }
 
 impl Render for PanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = label_for(&self.id).to_string();
-        let mut rows = div().flex().flex_col().gap_2().mt_3();
-        for (label, value) in panel_rows(&self.id, &self.system) {
-            rows = rows.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .gap_4()
-                    .child(div().text_color(rgb(0xa1a1aa)).child(label))
-                    .child(div().text_color(rgb(0xf4f4f5)).child(value)),
-            );
-        }
+        let title = self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.item(&self.active_menu))
+            .map(|item| {
+                if item.title.is_empty() {
+                    item.label.clone()
+                } else {
+                    item.title.clone()
+                }
+            })
+            .unwrap_or_else(|| label_for(&self.id).to_string());
+        let content = if self.menu.is_some() {
+            self.menu_content(cx)
+        } else {
+            let mut rows = div().flex().flex_col().gap_2().mt_3();
+            for (label, value) in panel_rows(&self.id, &self.system) {
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap_4()
+                        .child(div().text_color(rgb(0xa1a1aa)).child(label))
+                        .child(div().text_color(rgb(0xf4f4f5)).child(value)),
+                );
+            }
+            rows
+        };
+        let actions = self.actions(cx);
 
         div()
             .id("omarchy-gpui-panel")
@@ -399,8 +534,8 @@ impl Render for PanelView {
                             .on_click(|_, window, _| window.remove_window()),
                     ),
             )
-            .child(rows)
-            .child(self.actions(cx))
+            .child(content)
+            .child(actions)
             .when(!self.message.is_empty(), |panel| {
                 panel.child(
                     div()
@@ -428,6 +563,22 @@ fn is_panel_capable(id: &str) -> bool {
             | "omarchy.weather"
             | "omarchy.media"
     )
+}
+
+fn menu_label(item: &MenuItem) -> String {
+    let mut label = if item.icon.is_empty() {
+        item.label.clone()
+    } else {
+        format!("{}  {}", item.icon, item.label)
+    };
+    if !item.checked.is_empty() && MenuModel::evaluate_guard(&item.checked) {
+        label.push_str("  ✓");
+    }
+    if label.is_empty() {
+        item.id.clone()
+    } else {
+        label
+    }
 }
 
 fn panel_rows(id: &str, system: &SystemSnapshot) -> Vec<(String, String)> {
