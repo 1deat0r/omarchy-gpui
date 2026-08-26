@@ -373,15 +373,76 @@ impl PanelView {
                     .child(self.action_button("Play/Pause", SystemAction::MediaPlayPause, cx))
                     .child(self.action_button("Next", SystemAction::MediaNext, cx));
             }
-            "omarchy.network"
+            "omarchy.network" => {
                 if !self.system.network.connection.is_empty()
-                    && self.system.network.connection != "--" =>
-            {
-                actions = actions.child(self.action_button(
-                    "Reconnect",
-                    SystemAction::ActivateNetwork(self.system.network.connection.clone()),
-                    cx,
-                ));
+                    && self.system.network.connection != "--"
+                {
+                    actions = actions.child(self.action_button(
+                        "Reconnect",
+                        SystemAction::ActivateNetwork(self.system.network.connection.clone()),
+                        cx,
+                    ));
+                }
+                for band in &self.system.network.band.available {
+                    actions = actions.child(self.action_button(
+                        &format!("Band {band}"),
+                        SystemAction::SetNetworkBand(band.clone()),
+                        cx,
+                    ));
+                }
+            }
+            "omarchy.monitor" => {
+                if self.system.display.brightness_available {
+                    actions = actions.child(self.action_button(
+                        "Brightness 50%",
+                        SystemAction::SetBrightness {
+                            monitor: self.system.display.focused_monitor.clone(),
+                            percent: 50,
+                        },
+                        cx,
+                    ));
+                }
+                if !self.system.display.focused_monitor.is_empty() {
+                    actions = actions
+                        .child(self.action_button(
+                            "Scale 1.25",
+                            SystemAction::SetMonitorScale("1.25".to_string()),
+                            cx,
+                        ))
+                        .child(self.action_button("Text 12px", SystemAction::SetTextSize(12), cx));
+                    actions = actions.child(self.action_button(
+                        "Toggle nightlight",
+                        SystemAction::ToggleNightlight,
+                        cx,
+                    ));
+                }
+                for display in &self.system.display.displays {
+                    let action_label = if display.enabled {
+                        format!("Disable {}", display.name)
+                    } else {
+                        format!("Enable {}", display.name)
+                    };
+                    actions = actions.child(self.action_button(
+                        &action_label,
+                        SystemAction::ToggleDisplay {
+                            name: display.name.clone(),
+                            enabled: display.enabled,
+                        },
+                        cx,
+                    ));
+                }
+            }
+            "omarchy.power" => {
+                for profile in &self.system.power.profiles {
+                    actions = actions.child(self.action_button(
+                        &format!("Use {}", profile.name),
+                        SystemAction::SetPowerProfile {
+                            profile: profile.name.clone(),
+                            on_battery: !self.system.battery.charging,
+                        },
+                        cx,
+                    ));
+                }
             }
             _ => {}
         }
@@ -634,6 +695,40 @@ fn panel_rows(id: &str, system: &SystemSnapshot) -> Vec<(String, String)> {
                 "Connection".to_string(),
                 display_or_dash(&system.network.connection),
             ),
+            (
+                "Signal".to_string(),
+                system
+                    .network
+                    .signal_percent
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+            (
+                "Band".to_string(),
+                display_or_dash(&system.network.band.current),
+            ),
+        ],
+        "omarchy.monitor" => vec![
+            (
+                "Focused".to_string(),
+                display_or_dash(&system.display.focused_monitor),
+            ),
+            (
+                "Brightness".to_string(),
+                system
+                    .display
+                    .brightness_percent
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "Unavailable".to_string()),
+            ),
+            (
+                "Scale".to_string(),
+                display_or_dash(&system.display.monitor_scale),
+            ),
+            (
+                "Displays".to_string(),
+                system.display.displays.len().to_string(),
+            ),
         ],
         "omarchy.power" => vec![
             (
@@ -645,6 +740,10 @@ fn panel_rows(id: &str, system: &SystemSnapshot) -> Vec<(String, String)> {
                     .unwrap_or_else(|| "Unavailable".to_string()),
             ),
             ("State".to_string(), display_or_dash(&system.battery.state)),
+            (
+                "Profile".to_string(),
+                display_or_dash(&system.power.active_profile),
+            ),
         ],
         "omarchy.media" => vec![
             ("Player".to_string(), display_or_dash(&system.media.player)),

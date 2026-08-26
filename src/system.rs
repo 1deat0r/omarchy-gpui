@@ -8,6 +8,7 @@
 //! service is missing, and the same parsers can be exercised with fixtures.
 
 use std::{
+    collections::BTreeSet,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +23,10 @@ pub struct SystemSnapshot {
     pub bluetooth: BluetoothState,
     pub battery: BatteryState,
     pub media: MediaState,
+    pub display: DisplayState,
+    pub power: PowerState,
+    pub resources: ResourceState,
+    pub nightlight: NightlightState,
     pub collected_at: u64,
 }
 
@@ -34,6 +39,10 @@ impl SystemSnapshot {
             bluetooth: BluetoothState::collect(),
             battery: BatteryState::collect(),
             media: MediaState::collect(),
+            display: DisplayState::collect(),
+            power: PowerState::collect(),
+            resources: ResourceState::collect(),
+            nightlight: NightlightState::collect(),
             collected_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -53,6 +62,13 @@ pub enum SystemAction {
     MediaPrevious,
     SetBluetoothPower(bool),
     ActivateNetwork(String),
+    SetBrightness { monitor: String, percent: u8 },
+    ToggleDisplay { name: String, enabled: bool },
+    SetMonitorScale(String),
+    SetTextSize(u8),
+    SetPowerProfile { profile: String, on_battery: bool },
+    SetNetworkBand(String),
+    ToggleNightlight,
 }
 
 pub fn run_action(action: &SystemAction) -> Result<(), String> {
@@ -83,6 +99,53 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             validate_argument(connection, "network connection")?;
             command("nmcli", &["connection", "up", "id", connection]).map(|_| ())
         }
+        SystemAction::SetBrightness { monitor, percent } => {
+            validate_argument(monitor, "monitor")?;
+            let value = format!("{}%", (*percent).clamp(1, 100));
+            command(
+                "omarchy-brightness-display",
+                &["--no-osd", "--monitor", monitor, &value],
+            )
+            .map(|_| ())
+        }
+        SystemAction::ToggleDisplay { name, enabled } => {
+            validate_argument(name, "monitor")?;
+            let rule = if *enabled {
+                format!("{name},preferred,auto,auto")
+            } else {
+                format!("{name},disable")
+            };
+            command("hyprctl", &["keyword", "monitor", &rule]).map(|_| ())
+        }
+        SystemAction::SetMonitorScale(scale) => {
+            validate_argument(scale, "monitor scale")?;
+            command("omarchy-hyprland-monitor-scaling", &[scale]).map(|_| ())
+        }
+        SystemAction::SetTextSize(size) => {
+            if !(9..=20).contains(size) {
+                return Err("invalid text size".to_string());
+            }
+            let value = size.to_string();
+            command("omarchy-display-text-size", &[&value]).map(|_| ())
+        }
+        SystemAction::SetPowerProfile {
+            profile,
+            on_battery,
+        } => {
+            validate_argument(profile, "power profile")?;
+            command(
+                "omarchy-powerprofiles-set",
+                &[if *on_battery { "battery" } else { "ac" }, profile],
+            )
+            .map(|_| ())
+        }
+        SystemAction::SetNetworkBand(band) => {
+            if !matches!(band.as_str(), "auto" | "2.4" | "5" | "6") {
+                return Err("invalid network band".to_string());
+            }
+            command("omarchy-network-band", &[band]).map(|_| ())
+        }
+        SystemAction::ToggleNightlight => command("omarchy-toggle-nightlight", &[]).map(|_| ()),
     }
 }
 
@@ -101,6 +164,22 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
                 "monitor": workspace.monitor,
                 "windows": workspace.windows,
             })).collect::<Vec<_>>(),
+            "monitors": snapshot.hyprland.monitors.iter().map(|monitor| serde_json::json!({
+                "name": monitor.name,
+                "description": monitor.description,
+                "make": monitor.make,
+                "model": monitor.model,
+                "serial": monitor.serial,
+                "width": monitor.width,
+                "height": monitor.height,
+                "refreshRate": monitor.refresh_rate,
+                "x": monitor.x,
+                "y": monitor.y,
+                "scale": monitor.scale,
+                "focused": monitor.focused,
+                "enabled": monitor.enabled,
+                "mirrorOf": monitor.mirror_of,
+            })).collect::<Vec<_>>(),
             "error": snapshot.hyprland.error,
         },
         "audio": {
@@ -116,12 +195,47 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "device": snapshot.network.device,
             "kind": snapshot.network.kind,
             "connection": snapshot.network.connection,
+            "ssid": snapshot.network.ssid,
+            "signalPercent": snapshot.network.signal_percent,
+            "frequencyMhz": snapshot.network.frequency_mhz,
+            "details": {
+                "iface": snapshot.network.details.iface,
+                "ip": snapshot.network.details.ip,
+                "prefix": snapshot.network.details.prefix,
+                "gateway": snapshot.network.details.gateway,
+                "rxBytes": snapshot.network.details.rx_bytes,
+                "txBytes": snapshot.network.details.tx_bytes,
+                "signalDbm": snapshot.network.details.signal_dbm,
+                "frequencyMhz": snapshot.network.details.frequency_mhz,
+                "bitrate": snapshot.network.details.bitrate,
+                "routerPingMs": snapshot.network.details.router_ping_ms,
+                "internetPingMs": snapshot.network.details.internet_ping_ms,
+            },
+            "band": {
+                "current": snapshot.network.band.current,
+                "selected": snapshot.network.band.selected,
+                "available": snapshot.network.band.available,
+            },
+            "wifiNetworks": snapshot.network.wifi_networks.iter().map(|network| serde_json::json!({
+                "ssid": network.ssid,
+                "signalPercent": network.signal_percent,
+                "frequencyMhz": network.frequency_mhz,
+                "security": network.security,
+                "connected": network.connected,
+                "known": network.known,
+                "device": network.device,
+            })).collect::<Vec<_>>(),
             "error": snapshot.network.error,
         },
         "bluetooth": {
             "available": snapshot.bluetooth.available,
             "powered": snapshot.bluetooth.powered,
             "connectedDevices": snapshot.bluetooth.connected_devices,
+            "devices": snapshot.bluetooth.devices.iter().map(|device| serde_json::json!({
+                "address": device.address,
+                "name": device.name,
+                "connected": device.connected,
+            })).collect::<Vec<_>>(),
             "error": snapshot.bluetooth.error,
         },
         "battery": {
@@ -129,6 +243,11 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "percentage": snapshot.battery.percentage,
             "charging": snapshot.battery.charging,
             "state": snapshot.battery.state,
+            "rate": snapshot.battery.rate,
+            "size": snapshot.battery.size,
+            "time": snapshot.battery.time_remaining,
+            "cycles": snapshot.battery.cycles,
+            "threshold": snapshot.battery.threshold,
             "error": snapshot.battery.error,
         },
         "media": {
@@ -139,6 +258,47 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "title": snapshot.media.title,
             "error": snapshot.media.error,
         },
+        "display": {
+            "available": snapshot.display.available,
+            "brightness": snapshot.display.brightness_percent,
+            "brightnessAvailable": snapshot.display.brightness_available,
+            "internalMonitor": snapshot.display.internal_monitor,
+            "externalMonitor": snapshot.display.external_monitor,
+            "focusedMonitor": snapshot.display.focused_monitor,
+            "internalEnabled": snapshot.display.internal_enabled,
+            "mirrorEnabled": snapshot.display.mirror_enabled,
+            "scale": snapshot.display.monitor_scale,
+            "textSize": snapshot.display.text_size,
+            "displays": snapshot.display.displays.iter().map(|display| serde_json::json!({
+                "name": display.name,
+                "enabled": display.enabled,
+                "focused": display.focused,
+                "width": display.width,
+                "height": display.height,
+            })).collect::<Vec<_>>(),
+            "error": snapshot.display.error,
+        },
+        "power": {
+            "activeProfile": snapshot.power.active_profile,
+            "profiles": snapshot.power.profiles.iter().map(|profile| serde_json::json!({
+                "name": profile.name,
+                "active": profile.active,
+            })).collect::<Vec<_>>(),
+            "error": snapshot.power.error,
+        },
+        "resources": {
+            "cpuPercent": snapshot.resources.cpu_percent,
+            "memoryUsed": snapshot.resources.memory_used,
+            "memoryTotal": snapshot.resources.memory_total,
+            "load": snapshot.resources.load,
+            "error": snapshot.resources.error,
+        },
+        "nightlight": {
+            "available": snapshot.nightlight.available,
+            "temperature": snapshot.nightlight.temperature,
+            "active": snapshot.nightlight.active,
+            "error": snapshot.nightlight.error,
+        },
     })
 }
 
@@ -147,6 +307,7 @@ pub struct HyprlandState {
     pub available: bool,
     pub active_workspace: String,
     pub workspaces: Vec<WorkspaceState>,
+    pub monitors: Vec<MonitorState>,
     pub active_window: String,
     pub active_class: String,
     pub monitor: String,
@@ -159,6 +320,24 @@ pub struct WorkspaceState {
     pub name: String,
     pub monitor: String,
     pub windows: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MonitorState {
+    pub name: String,
+    pub description: String,
+    pub make: String,
+    pub model: String,
+    pub serial: String,
+    pub width: i64,
+    pub height: i64,
+    pub refresh_rate: String,
+    pub x: i64,
+    pub y: i64,
+    pub scale: String,
+    pub focused: bool,
+    pub enabled: bool,
+    pub mirror_of: String,
 }
 
 impl HyprlandState {
@@ -185,9 +364,48 @@ pub fn parse_hyprland(
     workspaces: Option<&Value>,
     active_window: Option<&Value>,
 ) -> HyprlandState {
-    let monitor = monitors
-        .as_array()
-        .and_then(|items| items.first())
+    let monitor_items = monitors.as_array().cloned().unwrap_or_default();
+    let parsed_monitors = monitor_items
+        .iter()
+        .map(|monitor| MonitorState {
+            name: value_string(monitor, "name"),
+            description: value_string(monitor, "description"),
+            make: value_string(monitor, "make"),
+            model: value_string(monitor, "model"),
+            serial: value_string(monitor, "serial"),
+            width: value_i64(monitor, "width"),
+            height: value_i64(monitor, "height"),
+            refresh_rate: monitor
+                .get("refreshRate")
+                .and_then(Value::as_f64)
+                .map(|rate| format!("{rate:.2}"))
+                .unwrap_or_default(),
+            x: value_i64(monitor, "x"),
+            y: value_i64(monitor, "y"),
+            scale: monitor
+                .get("scale")
+                .map(|scale| {
+                    scale
+                        .as_f64()
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| scale.as_str().unwrap_or_default().to_string())
+                })
+                .unwrap_or_default(),
+            focused: monitor
+                .get("focused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            enabled: !monitor
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            mirror_of: value_string(monitor, "mirrorOf"),
+        })
+        .collect::<Vec<_>>();
+    let monitor = monitor_items
+        .iter()
+        .find(|monitor| monitor.get("focused").and_then(Value::as_bool) == Some(true))
+        .or_else(|| monitor_items.first())
         .cloned()
         .unwrap_or(Value::Null);
     let active_workspace = monitor
@@ -246,6 +464,7 @@ pub fn parse_hyprland(
         available: monitors.is_array(),
         active_workspace,
         workspaces: parsed_workspaces,
+        monitors: parsed_monitors,
         active_window: active_title,
         active_class,
         monitor: monitor
@@ -255,6 +474,18 @@ pub fn parse_hyprland(
             .to_string(),
         error: None,
     }
+}
+
+fn value_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn value_i64(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -326,12 +557,22 @@ pub struct NetworkState {
     pub device: String,
     pub kind: String,
     pub connection: String,
+    pub ssid: String,
+    pub signal_percent: Option<u8>,
+    pub frequency_mhz: String,
+    pub details: NetworkDetails,
+    pub wifi_networks: Vec<WifiNetwork>,
+    pub band: NetworkBand,
     pub error: Option<String>,
 }
 
 impl NetworkState {
     fn collect() -> Self {
-        match command(
+        let status = command("omarchy-network-status", &[])
+            .ok()
+            .map(|raw| parse_network_status(&raw));
+        let mut network = status.unwrap_or_default();
+        if let Ok(raw) = command(
             "nmcli",
             &[
                 "-t",
@@ -343,12 +584,40 @@ impl NetworkState {
                 "status",
             ],
         ) {
-            Ok(raw) => parse_nmcli_device_status(&raw),
-            Err(error) => Self {
-                error: Some(error),
-                ..Self::default()
-            },
+            let nmcli = parse_nmcli_device_status(&raw);
+            if !nmcli.device.is_empty() {
+                network.device = nmcli.device;
+                network.kind = nmcli.kind;
+                if !nmcli.connection.is_empty() {
+                    network.connection = nmcli.connection;
+                }
+                network.available = nmcli.available || network.available;
+            }
         }
+        if let Ok(raw) = command("omarchy-network-band", &[]) {
+            network.band = parse_network_band(&raw);
+        }
+        if let Ok(raw) = command("omarchy-network-status", &["--verbose"]) {
+            network.details = parse_network_verbose(&raw);
+        }
+        if let Ok(raw) = command(
+            "nmcli",
+            &[
+                "-t",
+                "--escape",
+                "no",
+                "-f",
+                "IN-USE,SSID,SIGNAL,FREQ,SECURITY,DEVICE",
+                "device",
+                "wifi",
+                "list",
+                "--rescan",
+                "no",
+            ],
+        ) {
+            network.wifi_networks = parse_nmcli_wifi_list(&raw);
+        }
+        network
     }
 }
 
@@ -365,6 +634,7 @@ pub fn parse_nmcli_device_status(raw: &str) -> NetworkState {
             kind: fields[1].to_string(),
             connection: fields[3..].join(":"),
             error: None,
+            ..Default::default()
         };
         if fields[2] == "connected" {
             return candidate;
@@ -375,10 +645,176 @@ pub fn parse_nmcli_device_status(raw: &str) -> NetworkState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkDetails {
+    pub iface: String,
+    pub ip: String,
+    pub prefix: String,
+    pub gateway: String,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub signal_dbm: String,
+    pub frequency_mhz: String,
+    pub bitrate: String,
+    pub router_ping_ms: String,
+    pub internet_ping_ms: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    pub signal_percent: i32,
+    pub frequency_mhz: String,
+    pub security: String,
+    pub connected: bool,
+    pub known: bool,
+    pub device: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkBand {
+    pub current: String,
+    pub selected: String,
+    pub available: Vec<String>,
+}
+
+pub fn parse_network_status(raw: &str) -> NetworkState {
+    let line = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let fields = line.split('\t').collect::<Vec<_>>();
+    let kind = fields
+        .first()
+        .copied()
+        .unwrap_or("disconnected")
+        .to_string();
+    let connection = fields.get(1).copied().unwrap_or_default().to_string();
+    let signal_percent = fields
+        .get(2)
+        .and_then(|value| value.parse::<u8>().ok())
+        .map(|value| value.min(100));
+    let frequency_mhz = fields.get(3).copied().unwrap_or_default().to_string();
+    NetworkState {
+        available: kind != "disconnected",
+        kind,
+        connection: connection.clone(),
+        ssid: connection,
+        signal_percent,
+        frequency_mhz,
+        ..Default::default()
+    }
+}
+
+pub fn parse_network_verbose(raw: &str) -> NetworkDetails {
+    let mut details = NetworkDetails::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key {
+            "iface" => details.iface = value,
+            "ip" => details.ip = value,
+            "prefix" => details.prefix = value,
+            "gateway" => details.gateway = value,
+            "rx_bytes" => details.rx_bytes = value.parse().ok(),
+            "tx_bytes" => details.tx_bytes = value.parse().ok(),
+            "signal_dbm" => details.signal_dbm = value,
+            "freq" => details.frequency_mhz = value,
+            "bitrate" => details.bitrate = value,
+            "router_ping_ms" => details.router_ping_ms = value,
+            "internet_ping_ms" => details.internet_ping_ms = value,
+            _ => {}
+        }
+    }
+    details
+}
+
+pub fn parse_network_band(raw: &str) -> NetworkBand {
+    let mut band = NetworkBand::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+        match key {
+            "band" => band.current = value.trim().to_string(),
+            "selected" => band.selected = value.trim().to_string(),
+            "available" => band.available = value.split_whitespace().map(str::to_string).collect(),
+            _ => {}
+        }
+    }
+    if band.selected.is_empty() {
+        band.selected = "auto".to_string();
+    }
+    band
+}
+
+pub fn parse_nmcli_wifi_list(raw: &str) -> Vec<WifiNetwork> {
+    let mut networks = raw
+        .lines()
+        .filter_map(|line| {
+            let tab_fields = line.split('\t').collect::<Vec<_>>();
+            let fields = if tab_fields.len() >= 6 {
+                tab_fields
+            } else {
+                line.split(':').collect::<Vec<_>>()
+            };
+            let (ssid, signal_index, frequency, security, device) =
+                if fields.len() >= 6 && fields[2].parse::<i32>().is_ok() {
+                    (
+                        fields[1].to_string(),
+                        2,
+                        fields[3].to_string(),
+                        fields[4].to_string(),
+                        fields[5..].join(":"),
+                    )
+                } else {
+                    let signal_index = (1..fields.len().saturating_sub(2)).find(|index| {
+                        fields[*index].parse::<i32>().is_ok()
+                            && fields
+                                .get(*index + 1)
+                                .and_then(|value| value.parse::<f64>().ok())
+                                .is_some()
+                    })?;
+                    (
+                        fields[1..signal_index].join(":"),
+                        signal_index,
+                        fields[signal_index + 1].to_string(),
+                        fields
+                            .get(signal_index + 2)
+                            .copied()
+                            .unwrap_or_default()
+                            .to_string(),
+                        fields[signal_index + 3..].join(":"),
+                    )
+                };
+            Some(WifiNetwork {
+                connected: fields[0] == "*",
+                ssid,
+                signal_percent: fields[signal_index].parse().unwrap_or(-1).clamp(-1, 100),
+                frequency_mhz: frequency,
+                security,
+                device,
+                ..Default::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    networks.sort_by(|left, right| {
+        right
+            .connected
+            .cmp(&left.connected)
+            .then_with(|| right.signal_percent.cmp(&left.signal_percent))
+            .then_with(|| left.ssid.cmp(&right.ssid))
+    });
+    networks
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BluetoothState {
     pub available: bool,
     pub powered: bool,
     pub connected_devices: usize,
+    pub devices: Vec<BluetoothDevice>,
     pub error: Option<String>,
 }
 
@@ -393,10 +829,12 @@ impl BluetoothState {
                 };
             }
         };
-        let devices = command("bluetoothctl", &["devices", "Connected"])
-            .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
-            .unwrap_or_default();
-        parse_bluetooth_show(&show, devices)
+        let connected_raw = command("bluetoothctl", &["devices", "Connected"]).unwrap_or_default();
+        let devices_raw = command("bluetoothctl", &["devices"]).unwrap_or_default();
+        let devices = parse_bluetooth_devices(&devices_raw, &connected_raw);
+        let mut state = parse_bluetooth_show(&show, devices.len());
+        state.devices = devices;
+        state
     }
 }
 
@@ -412,8 +850,56 @@ pub fn parse_bluetooth_show(raw: &str, connected_devices: usize) -> BluetoothSta
             .any(|line| line.trim_start().starts_with("Controller")),
         powered,
         connected_devices,
+        devices: Vec::new(),
         error: None,
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BluetoothDevice {
+    pub address: String,
+    pub name: String,
+    pub connected: bool,
+}
+
+pub fn parse_bluetooth_devices(all_raw: &str, connected_raw: &str) -> Vec<BluetoothDevice> {
+    let connected = connected_raw
+        .lines()
+        .filter_map(parse_bluetooth_device_line)
+        .map(|device| device.address)
+        .collect::<BTreeSet<_>>();
+    let mut devices = all_raw
+        .lines()
+        .filter_map(parse_bluetooth_device_line)
+        .map(|mut device| {
+            device.connected = connected.contains(&device.address);
+            device
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        right
+            .connected
+            .cmp(&left.connected)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    devices
+}
+
+fn parse_bluetooth_device_line(line: &str) -> Option<BluetoothDevice> {
+    let mut fields = line.splitn(3, ' ');
+    if fields.next()? != "Device" {
+        return None;
+    }
+    let address = fields.next()?.trim();
+    if address.is_empty() {
+        return None;
+    }
+    Some(BluetoothDevice {
+        address: address.to_string(),
+        name: fields.next().unwrap_or_default().trim().to_string(),
+        connected: false,
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -422,11 +908,22 @@ pub struct BatteryState {
     pub percentage: Option<u8>,
     pub charging: bool,
     pub state: String,
+    pub rate: String,
+    pub size: String,
+    pub time_remaining: String,
+    pub cycles: String,
+    pub threshold: String,
     pub error: Option<String>,
 }
 
 impl BatteryState {
     fn collect() -> Self {
+        if let Ok(raw) = command("omarchy-battery-status", &["--shell"]) {
+            let parsed = parse_battery_shell(&raw);
+            if parsed.available {
+                return parsed;
+            }
+        }
         let raw = match command(
             "upower",
             &["-i", "/org/freedesktop/UPower/devices/DisplayDevice"],
@@ -469,7 +966,37 @@ pub fn parse_upower_display(raw: &str) -> BatteryState {
         percentage,
         state,
         error: None,
+        ..Default::default()
     }
+}
+
+pub fn parse_battery_shell(raw: &str) -> BatteryState {
+    let mut state = BatteryState::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key {
+            "percentage" => {
+                state.percentage = value
+                    .trim_end_matches('%')
+                    .parse::<u8>()
+                    .ok()
+                    .map(|value| value.min(100));
+            }
+            "state" => state.state = value,
+            "rate" => state.rate = value,
+            "size" => state.size = value,
+            "time" => state.time_remaining = value,
+            "cycles" => state.cycles = value,
+            "threshold" => state.threshold = value,
+            _ => {}
+        }
+    }
+    state.available = state.percentage.is_some() || !state.state.is_empty();
+    state.charging = matches!(state.state.as_str(), "charging" | "fully-charged");
+    state
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -517,6 +1044,250 @@ pub fn parse_playerctl_metadata(raw: &str) -> MediaState {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DisplayState {
+    pub available: bool,
+    pub brightness_percent: Option<u8>,
+    pub brightness_available: bool,
+    pub internal_monitor: String,
+    pub external_monitor: String,
+    pub focused_monitor: String,
+    pub internal_enabled: bool,
+    pub mirror_enabled: bool,
+    pub monitor_scale: String,
+    pub text_size: Option<u8>,
+    pub displays: Vec<DisplayInfo>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DisplayInfo {
+    pub name: String,
+    pub enabled: bool,
+    pub focused: bool,
+    pub width: i64,
+    pub height: i64,
+}
+
+impl DisplayState {
+    fn collect() -> Self {
+        let raw = match command("omarchy-monitor-state", &[]) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return Self {
+                    error: Some(error),
+                    ..Self::default()
+                };
+            }
+        };
+        let mut state = parse_monitor_state(&raw);
+        state.text_size = command("omarchy-display-text-size", &[])
+            .ok()
+            .and_then(|raw| parse_text_size(&raw));
+        state
+    }
+}
+
+pub fn parse_monitor_state(raw: &str) -> DisplayState {
+    let lines = raw.split('\n').collect::<Vec<_>>();
+    let brightness = lines
+        .first()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .map(|value| value.min(100));
+    let displays = lines
+        .get(7)
+        .and_then(|value| serde_json::from_str::<Value>(value.trim()).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|display| {
+            Some(DisplayInfo {
+                name: display.get("name")?.as_str()?.to_string(),
+                enabled: display
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                focused: display
+                    .get("focused")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                width: display
+                    .get("width")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                height: display
+                    .get("height")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let external_monitor = lines.get(2).copied().unwrap_or_default().trim().to_string();
+    DisplayState {
+        available: !displays.is_empty(),
+        brightness_percent: brightness,
+        brightness_available: brightness.is_some(),
+        internal_monitor: lines.get(1).copied().unwrap_or_default().trim().to_string(),
+        external_monitor: external_monitor.clone(),
+        focused_monitor: lines.get(5).copied().unwrap_or_default().trim().to_string(),
+        internal_enabled: !lines.get(3).copied().unwrap_or_default().trim().is_empty(),
+        mirror_enabled: !external_monitor.is_empty()
+            && lines.get(4).copied().unwrap_or_default().trim() == external_monitor,
+        monitor_scale: lines.get(6).copied().unwrap_or_default().trim().to_string(),
+        text_size: None,
+        displays,
+        error: None,
+    }
+}
+
+pub fn parse_text_size(raw: &str) -> Option<u8> {
+    raw.lines()
+        .find_map(|line| line.trim().strip_prefix("text size:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| (9..=20).contains(value))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PowerState {
+    pub profiles: Vec<PowerProfile>,
+    pub active_profile: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PowerProfile {
+    pub name: String,
+    pub active: bool,
+}
+
+impl PowerState {
+    fn collect() -> Self {
+        match command("omarchy-powerprofiles-list", &["--active-state"]) {
+            Ok(raw) => parse_power_profiles(&raw),
+            Err(error) => Self {
+                error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+pub fn parse_power_profiles(raw: &str) -> PowerState {
+    let profiles = raw
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let name = fields.first()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(PowerProfile {
+                name: name.to_string(),
+                active: fields.get(1).is_some_and(|value| value.trim() == "1"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let active_profile = profiles
+        .iter()
+        .find(|profile| profile.active)
+        .map(|profile| profile.name.clone())
+        .unwrap_or_default();
+    PowerState {
+        profiles,
+        active_profile,
+        error: None,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceState {
+    pub available: bool,
+    pub cpu_percent: Option<u8>,
+    pub memory_used: String,
+    pub memory_total: String,
+    pub load: String,
+    pub error: Option<String>,
+}
+
+impl ResourceState {
+    fn collect() -> Self {
+        match command("omarchy-system-stats", &[]) {
+            Ok(raw) => parse_system_stats(&raw),
+            Err(error) => Self {
+                error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+pub fn parse_system_stats(raw: &str) -> ResourceState {
+    let mut state = ResourceState::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "cpu" => {
+                state.cpu_percent = value
+                    .trim_end_matches('%')
+                    .parse::<u8>()
+                    .ok()
+                    .map(|value| value.min(100));
+            }
+            "memory" => {
+                let fields = value.split_once(" / ");
+                state.memory_used = fields
+                    .map(|(used, _)| used.to_string())
+                    .unwrap_or_else(|| value.to_string());
+                state.memory_total = fields
+                    .map(|(_, total)| total.to_string())
+                    .unwrap_or_default();
+            }
+            "load" => state.load = value.to_string(),
+            _ => {}
+        }
+    }
+    state.available =
+        state.cpu_percent.is_some() || !state.memory_used.is_empty() || !state.load.is_empty();
+    state
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NightlightState {
+    pub available: bool,
+    pub temperature: Option<u16>,
+    pub active: bool,
+    pub error: Option<String>,
+}
+
+impl NightlightState {
+    fn collect() -> Self {
+        match command("hyprctl", &["hyprsunset", "temperature"]) {
+            Ok(raw) => parse_nightlight_temperature(&raw),
+            Err(error) => Self {
+                error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+pub fn parse_nightlight_temperature(raw: &str) -> NightlightState {
+    let temperature = raw
+        .lines()
+        .flat_map(|line| line.split_whitespace())
+        .find_map(|value| value.parse::<u16>().ok());
+    NightlightState {
+        available: temperature.is_some(),
+        active: temperature.is_some_and(|value| value < 6000),
+        temperature,
+        error: None,
+    }
+}
+
 fn command(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
@@ -550,8 +1321,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SystemAction, parse_bluetooth_show, parse_hyprland, parse_nmcli_device_status,
-        parse_playerctl_metadata, parse_upower_display, parse_wpctl_volume, run_action,
+        SystemAction, parse_battery_shell, parse_bluetooth_devices, parse_bluetooth_show,
+        parse_hyprland, parse_monitor_state, parse_network_band, parse_network_status,
+        parse_network_verbose, parse_nightlight_temperature, parse_nmcli_device_status,
+        parse_nmcli_wifi_list, parse_playerctl_metadata, parse_power_profiles, parse_system_stats,
+        parse_text_size, parse_upower_display, parse_wpctl_volume, run_action,
     };
 
     #[test]
@@ -594,6 +1368,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_reference_network_status_and_verbose_details() {
+        let parsed = parse_network_status("wifi\tSTARLINK\t56\t5765.0\n");
+        assert!(parsed.available);
+        assert_eq!(parsed.kind, "wifi");
+        assert_eq!(parsed.ssid, "STARLINK");
+        assert_eq!(parsed.signal_percent, Some(56));
+        assert_eq!(parsed.frequency_mhz, "5765.0");
+
+        let details = parse_network_verbose(
+            "iface\twlp6s0\nip\t192.168.1.219\nrx_bytes\t123\nsignal_dbm\t-64\ninternet_ping_ms\t17.2\n",
+        );
+        assert_eq!(details.iface, "wlp6s0");
+        assert_eq!(details.rx_bytes, Some(123));
+        assert_eq!(details.signal_dbm, "-64");
+        assert_eq!(details.internet_ping_ms, "17.2");
+    }
+
+    #[test]
+    fn sorts_wifi_rows_with_connected_network_first() {
+        let rows = parse_nmcli_wifi_list(
+            "*\tHome\t42\t2412\tWPA2\twlan0\n \tGuest\t88\t5180\tWPA2\twlan0\n \tOpen\t88\t2412\t\twlan0\n",
+        );
+        assert_eq!(rows[0].ssid, "Home");
+        assert!(rows[0].connected);
+        assert_eq!(rows[1].ssid, "Guest");
+        assert_eq!(rows[2].ssid, "Open");
+    }
+
+    #[test]
+    fn parses_network_band_state() {
+        let band = parse_network_band("band\t5\navailable\t2.4 5\nselected\tauto\n");
+        assert_eq!(band.current, "5");
+        assert_eq!(band.available, vec!["2.4", "5"]);
+        assert_eq!(band.selected, "auto");
+    }
+
+    #[test]
     fn parses_bluetooth_power_and_connections() {
         let parsed = parse_bluetooth_show(
             "Controller AA:BB:CC:DD:EE:FF host [default]\n\tPowered: yes\n",
@@ -605,11 +1416,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_orders_bluetooth_devices() {
+        let devices = parse_bluetooth_devices(
+            "Device AA:BB:CC:DD:EE:FF Keyboard\nDevice 11:22:33:44:55:66 Headphones\n",
+            "Device 11:22:33:44:55:66 Headphones\n",
+        );
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name, "Headphones");
+        assert!(devices[0].connected);
+        assert!(!devices[1].connected);
+    }
+
+    #[test]
     fn parses_upower_display_state() {
         let parsed = parse_upower_display("state: charging\npercentage: 87%\n");
         assert!(parsed.available);
         assert!(parsed.charging);
         assert_eq!(parsed.percentage, Some(87));
+    }
+
+    #[test]
+    fn parses_battery_shell_state_and_auxiliary_fields() {
+        let parsed = parse_battery_shell(
+            "percentage\t87%\nstate\tcharging\nrate\t18.4W\nsize\t54Wh\ntime\t1h 20m\ncycles\t42\nthreshold\t40-80%\n",
+        );
+        assert!(parsed.available);
+        assert!(parsed.charging);
+        assert_eq!(parsed.percentage, Some(87));
+        assert_eq!(parsed.rate, "18.4W");
+        assert_eq!(parsed.threshold, "40-80%");
     }
 
     #[test]
@@ -621,8 +1456,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_monitor_state_and_text_size() {
+        let parsed = parse_monitor_state(
+            "\n\nInternal\n\n\nHDMI-A-1\n1.25\n[{\"name\":\"HDMI-A-1\",\"enabled\":true,\"focused\":true,\"width\":3440,\"height\":1440}]\n",
+        );
+        assert!(parsed.available);
+        assert_eq!(parsed.focused_monitor, "HDMI-A-1");
+        assert_eq!(parsed.monitor_scale, "1.25");
+        assert_eq!(parsed.displays[0].width, 3440);
+        assert_eq!(
+            parse_text_size("text size: 16 px\ngtk text-scaling-factor: 1.2\n"),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn parses_power_profiles_resources_and_nightlight() {
+        let power = parse_power_profiles("power-saver\t0\nbalanced\t1\nperformance\t0\n");
+        assert_eq!(power.active_profile, "balanced");
+        let resources = parse_system_stats("cpu\t13%\nmemory\t11.3GB / 31GB\nload\t0.42\n");
+        assert_eq!(resources.cpu_percent, Some(13));
+        assert_eq!(resources.memory_total, "31GB");
+        assert_eq!(resources.load, "0.42");
+        let nightlight = parse_nightlight_temperature("temperature: 4000\n");
+        assert!(nightlight.active);
+        assert_eq!(nightlight.temperature, Some(4000));
+    }
+
+    #[test]
     fn rejects_control_characters_before_shell_action() {
         let result = run_action(&SystemAction::FocusWorkspace(String::from("1\nquit")));
         assert_eq!(result, Err("invalid workspace".to_string()));
+    }
+
+    #[test]
+    fn rejects_invalid_control_values_before_desktop_actions() {
+        assert_eq!(
+            run_action(&SystemAction::SetBrightness {
+                monitor: "HDMI-A-1\n".to_string(),
+                percent: 50,
+            }),
+            Err("invalid monitor".to_string())
+        );
+        assert_eq!(
+            run_action(&SystemAction::SetTextSize(21)),
+            Err("invalid text size".to_string())
+        );
+        assert_eq!(
+            run_action(&SystemAction::SetNetworkBand("10".to_string())),
+            Err("invalid network band".to_string())
+        );
     }
 }
