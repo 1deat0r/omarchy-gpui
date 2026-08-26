@@ -232,6 +232,33 @@ pub fn parse_weather_status(raw: &str) -> WeatherState {
     }
 }
 
+/// Parse the metadata header and compact 0/1 matrix emitted by
+/// `omarchy-network-qr --meta`.
+///
+/// The QR command deliberately keeps the password inside the encoded matrix;
+/// only the interface, security mode, and SSID are exposed as display metadata.
+pub fn parse_network_qr(raw: &str) -> (String, Vec<String>) {
+    let mut meta = String::new();
+    let mut rows = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(rest) = line.strip_prefix("meta\t") {
+            let mut fields = rest.splitn(3, '\t');
+            let interface = fields.next().unwrap_or_default();
+            let security = fields.next().unwrap_or_default();
+            let ssid = fields.next().unwrap_or_default();
+            meta = match (interface.is_empty(), security.is_empty(), ssid.is_empty()) {
+                (false, false, false) => format!("Wi-Fi: {ssid} · {security} · {interface}"),
+                (false, false, true) => format!("Wi-Fi · {security} · {interface}"),
+                (false, true, false) => format!("Wi-Fi: {ssid} · {interface}"),
+                _ => "Wi-Fi connection".to_string(),
+            };
+        } else if line.chars().all(|character| matches!(character, '0' | '1')) {
+            rows.push(line.to_string());
+        }
+    }
+    (meta, rows)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdleState {
     pub enabled: bool,
@@ -434,8 +461,8 @@ fn command_present(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_default_agent, parse_keyboard_devices, parse_tailscale_status, parse_update_status,
-        parse_weather_status,
+        parse_default_agent, parse_keyboard_devices, parse_network_qr, parse_tailscale_status,
+        parse_update_status, parse_weather_status,
     };
 
     #[test]
@@ -468,5 +495,12 @@ mod tests {
         assert!(state.running);
         assert_eq!(state.status, "Connected");
         assert_eq!(state.peers, 2);
+    }
+
+    #[test]
+    fn network_qr_parser_keeps_metadata_and_matrix_separate() {
+        let (meta, rows) = parse_network_qr("meta\twlp6s0\tWPA\tSTARLINK\n0101\n1110\n");
+        assert_eq!(meta, "Wi-Fi: STARLINK · WPA · wlp6s0");
+        assert_eq!(rows, vec!["0101", "1110"]);
     }
 }

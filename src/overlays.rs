@@ -337,11 +337,9 @@ pub fn reminder_args(minutes: &str, message: &str) -> Option<Vec<String>> {
 }
 
 pub fn default_clipboard_history_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("omarchy/clipboard-history.json")
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/state/omarchy/clipboard-history.json"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/omarchy/clipboard-history.json"))
 }
 
 fn parse_bool(value: Option<&Value>) -> bool {

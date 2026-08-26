@@ -21,7 +21,7 @@ use crate::overlays::{
     emoji_rows_from_path, image_rows_from_payload, parse_image_picker_payload, reminder_args,
     valid_reminder_minutes,
 };
-use crate::plugins::PluginSnapshot;
+use crate::plugins::{PluginSnapshot, parse_network_qr};
 use crate::system::{BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action};
 
 pub struct ShellView {
@@ -380,6 +380,8 @@ struct PanelView {
     selected_menu_index: usize,
     overlay_rows: Vec<OverlayRow>,
     overlay_filterable: bool,
+    qr_meta: String,
+    qr_lines: Vec<String>,
     reminder_minutes: String,
     reminder_step_message: bool,
 }
@@ -395,9 +397,17 @@ impl PanelView {
     ) -> Self {
         let menu = (id == "omarchy.menu").then(MenuModel::load);
         let (overlay_rows, overlay_filterable) = overlay_rows_for(&id, payload, &snapshot);
+        let (qr_meta, qr_lines) = if id == "omarchy.wifiqr" {
+            wifi_qr_payload(&snapshot)
+        } else {
+            (String::new(), Vec::new())
+        };
         let refresh_id = id.clone();
         let refresh_snapshot = snapshot.clone();
         let refresh_plugin_path = snapshot.omarchy_path.clone();
+        let refresh_payload = payload.to_string();
+        let refresh_qr_id = id.clone();
+        let refresh_qr_snapshot = snapshot.clone();
         cx.spawn(async move |this, cx| {
             loop {
                 let system = cx
@@ -409,7 +419,7 @@ impl PanelView {
                         view.system = system;
                         if is_fullscreen_overlay(&refresh_id) && refresh_id != "omarchy.reminders" {
                             let (rows, filterable) =
-                                overlay_rows_for(&refresh_id, "{}", &refresh_snapshot);
+                                overlay_rows_for(&refresh_id, &refresh_payload, &refresh_snapshot);
                             if !rows.is_empty() || refresh_id == "omarchy.clipboard" {
                                 view.overlay_rows = rows;
                                 view.overlay_filterable = filterable;
@@ -435,9 +445,18 @@ impl PanelView {
                     .background_executor()
                     .spawn(async move { PluginSnapshot::collect(&path) })
                     .await;
+                let qr = if refresh_qr_id == "omarchy.wifiqr" {
+                    Some(wifi_qr_payload(&refresh_qr_snapshot))
+                } else {
+                    None
+                };
                 if this
                     .update(cx, |view, cx| {
                         view.plugins = plugins;
+                        if let Some((meta, rows)) = qr {
+                            view.qr_meta = meta;
+                            view.qr_lines = rows;
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -479,6 +498,8 @@ impl PanelView {
             selected_menu_index: 0,
             overlay_rows,
             overlay_filterable,
+            qr_meta,
+            qr_lines,
             reminder_minutes: String::new(),
             reminder_step_message: false,
         }
@@ -958,6 +979,28 @@ impl PanelView {
         content.child(rows_view)
     }
 
+    fn wifi_qr_content(&self) -> Div {
+        let mut content = div().flex().flex_col().gap_2().mt_3();
+        if !self.qr_meta.is_empty() {
+            content = content.child(div().text_color(rgb(0xa1a1aa)).child(self.qr_meta.clone()));
+        }
+        if self.qr_lines.is_empty() {
+            return content.child(
+                div()
+                    .text_color(rgb(0xfca5a5))
+                    .child("No QR data available."),
+            );
+        }
+        let mut qr = String::new();
+        for line in &self.qr_lines {
+            for cell in line.chars() {
+                qr.push_str(if cell == '1' { "██" } else { "  " });
+            }
+            qr.push('\n');
+        }
+        content.child(div().flex().justify_center().text_size(px(7.0)).child(qr))
+    }
+
     fn activate_overlay_action(
         &mut self,
         action: OverlayAction,
@@ -1345,6 +1388,8 @@ impl Render for PanelView {
             .unwrap_or_else(|| label_for(&self.id).to_string());
         let content = if self.menu.is_some() {
             self.menu_content(cx)
+        } else if self.id == "omarchy.wifiqr" {
+            self.wifi_qr_content()
         } else if self.is_overlay() {
             self.overlay_content(cx)
         } else {
@@ -1503,6 +1548,32 @@ fn overlay_rows_for(id: &str, payload: &str, snapshot: &ShellSnapshot) -> (Vec<O
             (image_rows_from_payload(&image_payload), filterable)
         }
         _ => (Vec::new(), false),
+    }
+}
+
+fn wifi_qr_payload(snapshot: &ShellSnapshot) -> (String, Vec<String>) {
+    let bundled = snapshot.omarchy_path.join("bin/omarchy-network-qr");
+    let program = if bundled.is_file() {
+        bundled
+    } else {
+        PathBuf::from("omarchy-network-qr")
+    };
+    match Command::new(program).arg("--meta").output() {
+        Ok(output) if output.status.success() => {
+            parse_network_qr(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            (
+                if detail.is_empty() {
+                    "Wi-Fi QR unavailable".to_string()
+                } else {
+                    format!("Wi-Fi QR unavailable: {detail}")
+                },
+                Vec::new(),
+            )
+        }
+        Err(error) => (format!("Wi-Fi QR unavailable: {error}"), Vec::new()),
     }
 }
 
