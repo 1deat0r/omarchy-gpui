@@ -246,38 +246,72 @@ impl ShellSnapshot {
         enabled: bool,
         placement: Option<&Value>,
     ) -> Result<bool, String> {
-        let manifest = self.plugin(id).cloned();
+        let key = id.to_string();
+        let manifest = self.plugin(&key).cloned();
         if enabled && manifest.is_none() {
             return Ok(false);
         }
 
         let mut next = self.config.clone();
         ensure_config_shape(&mut next)?;
-        let (is_bar, is_widget, is_first_party, cloned_from, default_section) = manifest
-            .as_ref()
-            .map(|manifest| {
-                (
-                    manifest.has_kind("bar"),
-                    manifest.has_kind("bar-widget"),
-                    manifest.source == PluginSource::FirstParty,
-                    manifest
-                        .raw
-                        .get("omarchy")
-                        .and_then(|metadata| metadata.get("clonedFrom"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    manifest
-                        .raw
-                        .get("barWidget")
-                        .and_then(|bar| bar.get("defaultSection"))
-                        .and_then(Value::as_str)
-                        .filter(|section| matches!(*section, "left" | "center" | "right"))
-                        .unwrap_or("center")
-                        .to_string(),
-                )
-            })
-            .unwrap_or((false, false, false, String::new(), "center".to_string()));
+        let (is_bar, is_widget, is_first_party, has_non_widget_kind, cloned_from, default_section) =
+            manifest
+                .as_ref()
+                .map(|manifest| {
+                    (
+                        manifest.has_kind("bar"),
+                        manifest.has_kind("bar-widget"),
+                        manifest.source == PluginSource::FirstParty,
+                        manifest.kinds.iter().any(|kind| kind != "bar-widget"),
+                        manifest
+                            .raw
+                            .get("omarchy")
+                            .and_then(|metadata| metadata.get("clonedFrom"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        manifest
+                            .raw
+                            .get("barWidget")
+                            .and_then(|bar| bar.get("defaultSection"))
+                            .and_then(Value::as_str)
+                            .filter(|section| matches!(*section, "left" | "center" | "right"))
+                            .unwrap_or("center")
+                            .to_string(),
+                    )
+                })
+                .unwrap_or((
+                    false,
+                    false,
+                    false,
+                    false,
+                    String::new(),
+                    "center".to_string(),
+                ));
+
+        if enabled
+            && let Some(placement) = placement.and_then(Value::as_object)
+            && let Some(relative_id) = placement
+                .get("before")
+                .or_else(|| placement.get("after"))
+                .and_then(Value::as_str)
+            && find_relative_bar_location(
+                &next,
+                &self.plugins,
+                relative_id,
+                placement.get("section").and_then(Value::as_str),
+            )
+            .is_none()
+        {
+            return Err(format!("could not find target widget {relative_id}"));
+        }
+
+        if enabled && is_first_party {
+            if let Some(active_clone) = active_clone_for(&next, &self.plugins, &key) {
+                restore_clone_source(&mut next, &self.plugins, &active_clone, &key);
+                remove_disabled(&mut next, &key);
+            }
+        }
 
         if is_bar {
             let bar = next
@@ -285,8 +319,8 @@ impl ShellSnapshot {
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| "bar config is not an object".to_string())?;
             if enabled {
-                bar.insert("id".to_string(), Value::String(id.to_string()));
-            } else if bar.get("id").and_then(Value::as_str) == Some(id) {
+                bar.insert("id".to_string(), Value::String(key.clone()));
+            } else if bar.get("id").and_then(Value::as_str) == Some(key.as_str()) {
                 if cloned_from.is_empty() || cloned_from == "omarchy.bar" {
                     bar.remove("id");
                 } else {
@@ -297,32 +331,67 @@ impl ShellSnapshot {
             return Ok(true);
         }
 
+        let location = find_entry_location(&next, &key);
         if enabled {
-            remove_disabled(&mut next, id);
+            remove_disabled(&mut next, &key);
+            let mut inserted_with_placement = false;
             if is_widget {
-                if bar_location(&next, id).is_none() {
-                    let entry = Value::Object(
-                        [("id".to_string(), Value::String(id.to_string()))]
-                            .into_iter()
-                            .collect(),
-                    );
-                    insert_bar_entry(&mut next, entry, default_section.as_str(), placement)?;
+                if location.is_none() {
+                    let entry = serde_json::json!({"id": key});
+                    if !cloned_from.is_empty()
+                        && let Some(source_location) = find_entry_location(&next, &cloned_from)
+                        && source_location.kind == EntryLocationKind::Bar
+                    {
+                        let source_entry = bar_entry(&next, &source_location)
+                            .cloned()
+                            .unwrap_or(entry.clone());
+                        let mut replacement = source_entry;
+                        replacement["id"] = Value::String(key.clone());
+                        replace_bar_entry(&mut next, &source_location, replacement)?;
+                    } else {
+                        insert_bar_entry(
+                            &mut next,
+                            &self.plugins,
+                            entry,
+                            default_section.as_str(),
+                            placement,
+                        )?;
+                        inserted_with_placement = true;
+                    }
                 }
-            } else if !is_first_party && !plugin_list_contains(&next, id) {
+            } else if location.is_none() && !is_first_party && !plugin_list_contains(&next, &key) {
                 next.get_mut("plugins")
                     .and_then(Value::as_array_mut)
                     .ok_or_else(|| "plugins config is not an array".to_string())?
                     .push(Value::Object(
-                        [("id".to_string(), Value::String(id.to_string()))]
+                        [("id".to_string(), Value::String(key.clone()))]
                             .into_iter()
                             .collect(),
                     ));
             }
+            if is_widget
+                && !inserted_with_placement
+                && placement
+                    .is_some_and(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+            {
+                move_bar_entry(&mut next, &self.plugins, &key, placement.unwrap())?;
+            }
+            if !cloned_from.is_empty() && has_non_widget_kind && !is_disabled(&next, &cloned_from) {
+                add_disabled(&mut next, &cloned_from);
+                set_clone_should_restore_source(&mut next, &key, true);
+            }
         } else {
-            remove_bar_entry(&mut next, id);
-            remove_plugin_entry(&mut next, id);
+            if !cloned_from.is_empty() {
+                restore_clone_source(&mut next, &self.plugins, &key, &cloned_from);
+            } else if let Some(location) = location {
+                match location.kind {
+                    EntryLocationKind::Bar => remove_bar_entry_at(&mut next, &location),
+                    EntryLocationKind::Plugin => remove_plugin_entry(&mut next, &key),
+                    EntryLocationKind::BarOption => {}
+                }
+            }
             if is_first_party && !is_widget {
-                add_disabled(&mut next, id);
+                add_disabled(&mut next, &key);
             }
         }
 
@@ -346,21 +415,9 @@ impl ShellSnapshot {
     }
 
     pub fn move_bar_widget(&mut self, id: &str, placement: &Value) -> Result<String, String> {
-        let Some((section, index)) = bar_location(&self.config, id) else {
-            return Ok(format!("could not find widget {id}"));
-        };
         let mut next = self.config.clone();
         ensure_config_shape(&mut next)?;
-        let entry = next
-            .get_mut("bar")
-            .and_then(Value::as_object_mut)
-            .and_then(|bar| bar.get_mut("layout"))
-            .and_then(Value::as_object_mut)
-            .and_then(|layout| layout.get_mut(&section))
-            .and_then(Value::as_array_mut)
-            .and_then(|entries| (index < entries.len()).then(|| entries.remove(index)))
-            .ok_or_else(|| format!("could not find widget {id}"))?;
-        insert_bar_entry(&mut next, entry, &section, Some(placement))?;
+        move_bar_entry(&mut next, &self.plugins, id, placement)?;
         self.persist_config(next)?;
         Ok(String::new())
     }
@@ -468,8 +525,33 @@ fn ensure_config_shape(config: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryLocationKind {
+    Bar,
+    BarOption,
+    Plugin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntryLocation {
+    kind: EntryLocationKind,
+    section: Option<String>,
+    index: usize,
+}
+
 fn bar_location(config: &Value, id: &str) -> Option<(String, usize)> {
+    bar_location_in(config, id, None)
+}
+
+fn bar_location_in(
+    config: &Value,
+    id: &str,
+    requested_section: Option<&str>,
+) -> Option<(String, usize)> {
     for section in ["left", "center", "right"] {
+        if requested_section.is_some_and(|requested| requested != section) {
+            continue;
+        }
         let Some(entries) = config
             .get("bar")
             .and_then(|bar| bar.get("layout"))
@@ -485,6 +567,162 @@ fn bar_location(config: &Value, id: &str) -> Option<(String, usize)> {
         }
     }
     None
+}
+
+fn find_entry_location(config: &Value, id: &str) -> Option<EntryLocation> {
+    if config
+        .get("bar")
+        .and_then(|bar| bar.get("id"))
+        .and_then(Value::as_str)
+        == Some(id)
+    {
+        return Some(EntryLocation {
+            kind: EntryLocationKind::BarOption,
+            section: None,
+            index: 0,
+        });
+    }
+    if let Some((section, index)) = bar_location(config, id) {
+        return Some(EntryLocation {
+            kind: EntryLocationKind::Bar,
+            section: Some(section),
+            index,
+        });
+    }
+    config
+        .get("plugins")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .position(|plugin| plugin.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .map(|index| EntryLocation {
+            kind: EntryLocationKind::Plugin,
+            section: None,
+            index,
+        })
+}
+
+fn find_relative_bar_location(
+    config: &Value,
+    plugins: &[PluginManifest],
+    id: &str,
+    requested_section: Option<&str>,
+) -> Option<(String, usize)> {
+    bar_location_in(config, id, requested_section).or_else(|| {
+        active_clone_for(config, plugins, id)
+            .and_then(|clone| bar_location_in(config, &clone, requested_section))
+    })
+}
+
+fn active_clone_for(config: &Value, plugins: &[PluginManifest], source_id: &str) -> Option<String> {
+    plugins
+        .iter()
+        .filter(|plugin| {
+            plugin
+                .raw
+                .get("omarchy")
+                .and_then(|metadata| metadata.get("clonedFrom"))
+                .and_then(Value::as_str)
+                == Some(source_id)
+        })
+        .find_map(|plugin| {
+            if plugin.has_kind("bar") {
+                let selected = config
+                    .get("bar")
+                    .and_then(|bar| bar.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                (selected == plugin.id).then(|| plugin.id.clone())
+            } else {
+                find_entry_location(config, &plugin.id).map(|_| plugin.id.clone())
+            }
+        })
+}
+
+fn is_disabled(config: &Value, id: &str) -> bool {
+    config
+        .get("disabledPlugins")
+        .and_then(Value::as_array)
+        .is_some_and(|disabled| disabled.iter().any(|entry| entry.as_str() == Some(id)))
+}
+
+fn clone_should_restore_source(config: &Value, id: &str) -> bool {
+    config
+        .get("cloneSourceRestores")
+        .and_then(Value::as_array)
+        .is_some_and(|restores| restores.iter().any(|entry| entry.as_str() == Some(id)))
+}
+
+fn set_clone_should_restore_source(config: &mut Value, id: &str, should_restore: bool) {
+    let object = config
+        .as_object_mut()
+        .expect("config object was checked before mutation");
+    let mut restores = object
+        .get("cloneSourceRestores")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    restores.retain(|entry| entry.as_str() != Some(id));
+    if should_restore {
+        restores.push(Value::String(id.to_string()));
+    }
+    if restores.is_empty() {
+        object.remove("cloneSourceRestores");
+    } else {
+        object.insert("cloneSourceRestores".to_string(), Value::Array(restores));
+    }
+}
+
+fn restore_clone_source(
+    config: &mut Value,
+    plugins: &[PluginManifest],
+    clone_id: &str,
+    source_id: &str,
+) {
+    let is_bar_option = plugins
+        .iter()
+        .find(|plugin| plugin.id == clone_id)
+        .is_some_and(|plugin| plugin.has_kind("bar"));
+
+    if is_bar_option {
+        let bar = config
+            .get_mut("bar")
+            .and_then(Value::as_object_mut)
+            .expect("config shape was checked before clone restoration");
+        if source_id == "omarchy.bar" {
+            bar.remove("id");
+        } else {
+            bar.insert("id".to_string(), Value::String(source_id.to_string()));
+        }
+    } else if let Some(clone_location) = find_entry_location(config, clone_id) {
+        match clone_location.kind {
+            EntryLocationKind::Bar => {
+                let clone_entry = bar_entry(config, &clone_location)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"id": source_id}));
+                remove_all_bar_entries(config, source_id);
+                if let Some(restored_location) = bar_location(config, clone_id) {
+                    let mut restored_entry = clone_entry;
+                    restored_entry["id"] = Value::String(source_id.to_string());
+                    let location = EntryLocation {
+                        kind: EntryLocationKind::Bar,
+                        section: Some(restored_location.0),
+                        index: restored_location.1,
+                    };
+                    let _ = replace_bar_entry(config, &location, restored_entry);
+                }
+            }
+            EntryLocationKind::Plugin => remove_plugin_entry_at(config, clone_location.index),
+            EntryLocationKind::BarOption => {}
+        }
+    }
+
+    if clone_should_restore_source(config, clone_id) {
+        remove_disabled(config, source_id);
+    }
+    set_clone_should_restore_source(config, clone_id, false);
 }
 
 fn selected_bar_location(
@@ -531,8 +769,8 @@ fn plugin_list_contains(config: &Value, id: &str) -> bool {
         })
 }
 
-fn remove_bar_entry(config: &mut Value, id: &str) {
-    let Some((section, index)) = bar_location(config, id) else {
+fn remove_bar_entry_at(config: &mut Value, location: &EntryLocation) {
+    let Some(section) = location.section.as_deref() else {
         return;
     };
     if let Some(entries) = config
@@ -540,12 +778,67 @@ fn remove_bar_entry(config: &mut Value, id: &str) {
         .and_then(Value::as_object_mut)
         .and_then(|bar| bar.get_mut("layout"))
         .and_then(Value::as_object_mut)
-        .and_then(|layout| layout.get_mut(&section))
+        .and_then(|layout| layout.get_mut(section))
         .and_then(Value::as_array_mut)
-        && index < entries.len()
+        && location.index < entries.len()
     {
-        entries.remove(index);
+        entries.remove(location.index);
     }
+}
+
+fn remove_all_bar_entries(config: &mut Value, id: &str) {
+    for section in ["left", "center", "right"] {
+        if let Some(entries) = config
+            .get_mut("bar")
+            .and_then(Value::as_object_mut)
+            .and_then(|bar| bar.get_mut("layout"))
+            .and_then(Value::as_object_mut)
+            .and_then(|layout| layout.get_mut(section))
+            .and_then(Value::as_array_mut)
+        {
+            entries.retain(|entry| entry.get("id").and_then(Value::as_str) != Some(id));
+        }
+    }
+}
+
+fn remove_plugin_entry_at(config: &mut Value, index: usize) {
+    if let Some(plugins) = config.get_mut("plugins").and_then(Value::as_array_mut)
+        && index < plugins.len()
+    {
+        plugins.remove(index);
+    }
+}
+
+fn bar_entry<'a>(config: &'a Value, location: &EntryLocation) -> Option<&'a Value> {
+    let section = location.section.as_deref()?;
+    config
+        .get("bar")
+        .and_then(|bar| bar.get("layout"))
+        .and_then(|layout| layout.get(section))
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.get(location.index))
+}
+
+fn replace_bar_entry(
+    config: &mut Value,
+    location: &EntryLocation,
+    entry: Value,
+) -> Result<(), String> {
+    let section = location
+        .section
+        .as_deref()
+        .ok_or_else(|| "bar entry has no section".to_string())?;
+    let target = config
+        .get_mut("bar")
+        .and_then(Value::as_object_mut)
+        .and_then(|bar| bar.get_mut("layout"))
+        .and_then(Value::as_object_mut)
+        .and_then(|layout| layout.get_mut(section))
+        .and_then(Value::as_array_mut)
+        .and_then(|entries| entries.get_mut(location.index))
+        .ok_or_else(|| format!("could not find widget at {section}[{}]", location.index))?;
+    *target = entry;
+    Ok(())
 }
 
 fn remove_plugin_entry(config: &mut Value, id: &str) {
@@ -590,67 +883,162 @@ fn add_disabled(config: &mut Value, id: &str) {
 
 fn insert_bar_entry(
     config: &mut Value,
+    plugins: &[PluginManifest],
     entry: Value,
     fallback_section: &str,
     placement: Option<&Value>,
 ) -> Result<(), String> {
     let placement = placement.and_then(Value::as_object);
+    let (section, index) = bar_target(config, plugins, placement, fallback_section)?;
+    let entries = config
+        .get_mut("bar")
+        .and_then(Value::as_object_mut)
+        .and_then(|bar| bar.get_mut("layout"))
+        .and_then(Value::as_object_mut)
+        .and_then(|layout| layout.get_mut(&section))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| format!("bar section {section} is not an array"))?;
+    entries.insert(index.min(entries.len()), entry);
+    Ok(())
+}
+
+fn bar_target(
+    config: &Value,
+    plugins: &[PluginManifest],
+    placement: Option<&serde_json::Map<String, Value>>,
+    fallback_section: &str,
+) -> Result<(String, usize), String> {
     let section = placement
         .and_then(|placement| placement.get("section"))
         .and_then(Value::as_str)
         .filter(|section| matches!(*section, "left" | "center" | "right"))
         .unwrap_or(fallback_section);
 
-    let index = if let Some(relative_id) = placement
+    if let Some(relative_id) = placement
         .and_then(|placement| placement.get("before").or_else(|| placement.get("after")))
         .and_then(Value::as_str)
     {
-        let (relative_section, relative_index) = bar_location(config, relative_id)
-            .ok_or_else(|| format!("could not find target widget {relative_id}"))?;
-        if placement
-            .and_then(|placement| placement.get("section"))
-            .and_then(Value::as_str)
-            .is_some_and(|requested| requested != relative_section)
-        {
-            return Err(format!(
-                "target widget {relative_id} is not in section {section}"
-            ));
-        }
-        relative_index
-            + usize::from(
-                placement
-                    .and_then(|placement| placement.get("after"))
-                    .is_some(),
-            )
-    } else if let Some(requested) = placement
+        let location = find_relative_bar_location(
+            config,
+            plugins,
+            relative_id,
+            placement
+                .and_then(|placement| placement.get("section"))
+                .and_then(Value::as_str),
+        )
+        .ok_or_else(|| format!("could not find target widget {relative_id}"))?;
+        return Ok((
+            location.0,
+            location.1
+                + usize::from(placement.is_some_and(|placement| placement.get("after").is_some())),
+        ));
+    }
+
+    if let Some(requested) = placement
         .and_then(|placement| placement.get("index"))
-        .and_then(Value::as_i64)
+        .and_then(number_as_f64)
     {
-        requested.max(0) as usize
+        return Ok((section.to_string(), requested.max(0.0).floor() as usize));
+    }
+
+    let anchor = match section {
+        "left" => "omarchy.workspaces",
+        "center" => "omarchy.weather",
+        "right" => "omarchy.tray",
+        _ => "",
+    };
+    let index = find_relative_bar_location(config, plugins, anchor, Some(section))
+        .map(|(_, index)| index + 1)
+        .unwrap_or_else(|| {
+            config
+                .get("bar")
+                .and_then(|bar| bar.get("layout"))
+                .and_then(|layout| layout.get(section))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        });
+    Ok((section.to_string(), index))
+}
+
+fn move_bar_entry(
+    config: &mut Value,
+    plugins: &[PluginManifest],
+    id: &str,
+    placement: &Value,
+) -> Result<(), String> {
+    let placement = placement
+        .as_object()
+        .ok_or_else(|| "placement must be an object".to_string())?;
+    let source = if let Some(from_index) = placement.get("fromIndex").and_then(number_as_f64) {
+        let from_section = placement
+            .get("fromSection")
+            .and_then(Value::as_str)
+            .filter(|section| matches!(*section, "left" | "center" | "right"))
+            .ok_or_else(|| "from-index requires from-section".to_string())?;
+        let index = from_index.floor() as isize;
+        if index < 0 {
+            return Err(format!("no widget at {from_section}[{index}]"));
+        }
+        let index = index as usize;
+        let entries = config
+            .get("bar")
+            .and_then(|bar| bar.get("layout"))
+            .and_then(|layout| layout.get(from_section))
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("no widget at {from_section}[{index}]"))?;
+        if index >= entries.len() {
+            return Err(format!("no widget at {from_section}[{index}]"));
+        }
+        if entries[index].get("id").and_then(Value::as_str) != Some(id) {
+            return Err(format!("widget at {from_section}[{index}] is not {id}"));
+        }
+        (from_section.to_string(), index)
     } else {
-        let anchor = match section {
-            "left" => "omarchy.workspaces",
-            "center" => "omarchy.weather",
-            "right" => "omarchy.tray",
-            _ => "",
-        };
-        bar_location(config, anchor)
-            .filter(|(anchor_section, _)| anchor_section == section)
-            .map(|(_, index)| index + 1)
-            .unwrap_or(usize::MAX)
+        let from_section = placement.get("fromSection").and_then(Value::as_str);
+        bar_location_in(config, id, from_section)
+            .ok_or_else(|| format!("could not find widget {id}"))?
     };
 
-    let entries = config
+    let location = EntryLocation {
+        kind: EntryLocationKind::Bar,
+        section: Some(source.0.clone()),
+        index: source.1,
+    };
+    let entry = bar_entry(config, &location)
+        .cloned()
+        .ok_or_else(|| format!("could not find widget {id}"))?;
+    remove_bar_entry_at(config, &location);
+    let target = match bar_target(config, plugins, Some(placement), &source.0) {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = insert_bar_entry(
+                config,
+                plugins,
+                entry,
+                &source.0,
+                Some(&serde_json::json!({
+                    "index": source.1
+                })),
+            );
+            return Err(error);
+        }
+    };
+    let target_entries = config
         .get_mut("bar")
         .and_then(Value::as_object_mut)
         .and_then(|bar| bar.get_mut("layout"))
         .and_then(Value::as_object_mut)
-        .and_then(|layout| layout.get_mut(section))
+        .and_then(|layout| layout.get_mut(&target.0))
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| format!("bar section {section} is not an array"))?;
-    let index = index.min(entries.len());
-    entries.insert(index, entry);
+        .ok_or_else(|| format!("bar section {} is not an array", target.0))?;
+    target_entries.insert(target.1.min(target_entries.len()), entry);
     Ok(())
+}
+
+fn number_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
 }
 
 fn config_contains_plugin(config: &Value, id: &str) -> bool {
@@ -986,6 +1374,56 @@ mod tests {
                 .unwrap()
         );
         assert!(snapshot.center.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enabling_and_disabling_a_clone_restores_the_source_entry_and_settings() {
+        let root = test_root("clone");
+        let omarchy = root.join("omarchy");
+        let home = root.join("home");
+        let source_dir = omarchy.join("shell/plugins/panels/audio");
+        let clone_dir = home.join(".config/omarchy/plugins/example.clone");
+        fs::create_dir_all(&source_dir).expect("create source manifest fixture");
+        fs::create_dir_all(&clone_dir).expect("create clone manifest fixture");
+        fs::create_dir_all(omarchy.join("config/omarchy")).expect("create defaults fixture");
+        fs::write(
+            omarchy.join("config/omarchy/shell.json"),
+            r#"{"version":1,"bar":{"layout":{"left":[],"center":[{"id":"omarchy.audio","format":"special"}],"right":[]}},"plugins":[]}"#,
+        )
+        .expect("write defaults fixture");
+        fs::write(
+            source_dir.join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"omarchy.audio","name":"Audio","version":"1.0.0","kinds":["bar-widget"],"entryPoints":{"barWidget":"Panel.qml"}}"#,
+        )
+        .expect("write source manifest fixture");
+        fs::write(
+            clone_dir.join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"example.clone","name":"Example Clone","version":"1.0.0","kinds":["bar-widget","panel"],"entryPoints":{"barWidget":"Panel.qml","panel":"Panel.qml"},"omarchy":{"clonedFrom":"omarchy.audio"}}"#,
+        )
+        .expect("write clone manifest fixture");
+
+        let mut snapshot = ShellSnapshot::load_from_paths(&omarchy, &home);
+        assert!(
+            snapshot
+                .set_plugin_enabled("example.clone", true, None)
+                .expect("enable clone")
+        );
+        assert_eq!(snapshot.center[0].id, "example.clone");
+        assert_eq!(snapshot.center[0].settings["format"], "special");
+        assert_eq!(snapshot.config["disabledPlugins"][0], "omarchy.audio");
+        assert_eq!(snapshot.config["cloneSourceRestores"][0], "example.clone");
+
+        assert!(
+            snapshot
+                .set_plugin_enabled("example.clone", false, None)
+                .expect("disable clone")
+        );
+        assert_eq!(snapshot.center[0].id, "omarchy.audio");
+        assert_eq!(snapshot.center[0].settings["format"], "special");
+        assert!(snapshot.config.get("disabledPlugins").is_none());
+        assert!(snapshot.config.get("cloneSourceRestores").is_none());
 
         let _ = fs::remove_dir_all(root);
     }
