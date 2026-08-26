@@ -25,7 +25,7 @@ fn main() {
         Some("--print-system") => print_system(),
         Some("--print-menu") => print_menu(),
         Some("--smoke") => run_shell(snapshot, true),
-        Some("shell") => match ipc::parse(&args) {
+        Some(target) if target == "shell" || !target.starts_with('-') => match ipc::parse(&args) {
             Ok(command) => {
                 match ipc::try_call_running(&args) {
                     Ok(Some(response)) => {

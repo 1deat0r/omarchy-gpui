@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     net::Shutdown,
     path::PathBuf,
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -92,6 +93,16 @@ pub enum ShellCommand {
         id: String,
         enabled: bool,
     },
+    ImageSelectorOpen {
+        payload: String,
+    },
+    ImageSelectorPreload {
+        payload: String,
+    },
+    ImageSelectorCancel {
+        done_file: String,
+    },
+    ImageSelectorPing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +120,6 @@ struct IpcRuntime {
     open_panel_ids: BTreeSet<String>,
     pending_payloads: BTreeMap<String, Vec<String>>,
     dnd_enabled: bool,
-    idle_enabled: bool,
     osd_open: bool,
 }
 
@@ -120,7 +130,6 @@ impl IpcRuntime {
             open_panel_ids: BTreeSet::new(),
             pending_payloads: BTreeMap::new(),
             dnd_enabled: false,
-            idle_enabled: true,
             osd_open: false,
         }
     }
@@ -328,7 +337,7 @@ fn socket_path() -> PathBuf {
 
 pub fn parse(args: &[String]) -> Result<ShellCommand, String> {
     if args.first().map(String::as_str) != Some("shell") {
-        return Err("expected the `shell` target".to_string());
+        return parse_direct_target(args);
     }
 
     match args.get(1).map(String::as_str) {
@@ -388,6 +397,67 @@ pub fn parse(args: &[String]) -> Result<ShellCommand, String> {
         Some(method) => Err(format!("unknown shell method: {method}")),
         None => Err("missing shell method".to_string()),
     }
+}
+
+fn parse_direct_target(args: &[String]) -> Result<ShellCommand, String> {
+    let target = required(args, 0, "IPC target")?;
+    let method = required(args, 1, "IPC method")?;
+
+    if target == "image-selector" {
+        return match method.as_str() {
+            "open" => {
+                let image_dirs = positional(args, 2, "image directories")?;
+                let image_rows = decode_utf8(positional(args, 3, "image rows")?);
+                let selected_image = positional(args, 4, "selected image")?;
+                let selection_file = positional(args, 5, "selection file")?;
+                let done_file = positional(args, 6, "done file")?;
+                let show_labels = positional(args, 7, "show labels")?;
+                let filterable = positional(args, 8, "filterable")?;
+                Ok(ShellCommand::ImageSelectorOpen {
+                    payload: serde_json::json!({
+                        "imageDirs": image_dirs,
+                        "imageRows": image_rows,
+                        "selectedImage": selected_image,
+                        "selectionFile": selection_file,
+                        "doneFile": done_file,
+                        "showLabels": show_labels,
+                        "filterable": filterable,
+                    })
+                    .to_string(),
+                })
+            }
+            "preload" => {
+                let image_rows = decode_utf8(positional(args, 2, "image rows")?);
+                let selected_image = positional(args, 3, "selected image")?;
+                let show_labels = positional(args, 4, "show labels")?;
+                let filterable = positional(args, 5, "filterable")?;
+                Ok(ShellCommand::ImageSelectorPreload {
+                    payload: serde_json::json!({
+                        "imageRows": image_rows,
+                        "selectedImage": selected_image,
+                        "showLabels": show_labels,
+                        "filterable": filterable,
+                    })
+                    .to_string(),
+                })
+            }
+            "cancel" => Ok(ShellCommand::ImageSelectorCancel {
+                done_file: args.get(2).cloned().unwrap_or_default(),
+            }),
+            "ping" => Ok(ShellCommand::ImageSelectorPing),
+            _ => Err(format!("unknown image-selector method: {method}")),
+        };
+    }
+
+    // The installed helper invokes service targets directly (`lock lock`,
+    // `nightlight toggle`, and similar). Those targets all currently accept a
+    // single string argument; root `shell call` remains the canonical path for
+    // that same one-argument contract.
+    Ok(ShellCommand::Call {
+        id: target,
+        method,
+        arg: args.get(2).cloned().unwrap_or_default(),
+    })
 }
 
 pub fn dispatch(command: &ShellCommand, snapshot: &mut ShellSnapshot) -> Result<String, String> {
@@ -526,6 +596,37 @@ fn dispatch_runtime(
                 Ok(outcome("unknown", None))
             }
         }
+        ShellCommand::ImageSelectorOpen { payload } => {
+            let Some(resolved) = summon_panel(runtime, "omarchy.image-picker", payload) else {
+                return Ok(outcome("unknown", None));
+            };
+            Ok(outcome(
+                "ok",
+                Some(IpcEvent::Summon {
+                    id: resolved,
+                    payload: payload.clone(),
+                }),
+            ))
+        }
+        ShellCommand::ImageSelectorPreload { payload } => {
+            runtime
+                .pending_payloads
+                .entry("omarchy.image-picker".to_string())
+                .or_default()
+                .push(payload.clone());
+            Ok(outcome("ok", None))
+        }
+        ShellCommand::ImageSelectorCancel { done_file } => {
+            finish_done_file(done_file)?;
+            runtime.open_panel_ids.remove("omarchy.image-picker");
+            Ok(outcome(
+                "ok",
+                Some(IpcEvent::Hide {
+                    id: "omarchy.image-picker".to_string(),
+                }),
+            ))
+        }
+        ShellCommand::ImageSelectorPing => Ok(outcome("ok", None)),
     }
 }
 
@@ -545,7 +646,9 @@ fn dispatch_call(
         return Ok(outcome("unknown", None));
     }
 
-    if matches!(method, "open" | "show" | "close" | "hide" | "toggle") {
+    if matches!(method, "open" | "show" | "close" | "hide" | "toggle")
+        && !(id == "omarchy.osd" && method == "show")
+    {
         return Ok(dispatch_call_lifecycle(runtime, &id, method, arg));
     }
 
@@ -739,50 +842,22 @@ fn dispatch_call(
             }
         }
 
-        ("omarchy.idle", "status" | "debug") => Ok(outcome(
-            &serde_json::json!({
-                "enabled": runtime.idle_enabled,
-                "stayAwake": false,
-                "stayAwakeStateLoaded": false,
-                "stayAwakeStatePath": "",
-                "idle": false,
-                "inIdleCycle": false,
-                "screensaverStarted": false,
-                "screensaver": 0,
-                "lock": 0,
-                "screensaverDelay": 0,
-                "lockDelay": 0,
-                "screensaverWindows": 0,
-                "timers": {
-                    "screensaver": false,
-                    "lock": false,
-                    "screensaverLaunchGrace": false,
-                },
-                "processes": {
-                    "screensaver": false,
-                    "lock": false,
-                    "wake": false,
-                },
-                "lastEvent": "",
-                "lastEventAt": 0,
-            })
-            .to_string(),
-            None,
-        )),
+        ("omarchy.idle", "status" | "debug") => {
+            match command_output("omarchy-toggle-idle", &["--status"]) {
+                Ok(value) => Ok(outcome(value.trim(), None)),
+                Err(_) => Ok(outcome("{}", None)),
+            }
+        }
         ("omarchy.idle", "enable" | "disable" | "toggle") => {
-            runtime.idle_enabled = match method {
-                "enable" => true,
-                "disable" => false,
-                _ => !runtime.idle_enabled,
+            let command = match method {
+                "enable" => "allow-idle",
+                "disable" => "stay-awake",
+                _ => "toggle",
             };
-            Ok(outcome(
-                if runtime.idle_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                None,
-            ))
+            match command_output("omarchy-toggle-idle", &[command]) {
+                Ok(value) => Ok(outcome(value.trim(), None)),
+                Err(_) => Ok(outcome("error", None)),
+            }
         }
 
         ("omarchy.lock", "isLocked") => Ok(outcome("false", None)),
@@ -817,7 +892,12 @@ fn dispatch_call(
             }),
         )),
 
-        ("omarchy.image-picker", "preload" | "cancel") => Ok(outcome("ok", None)),
+        ("omarchy.image-picker", "preload") => Ok(outcome("ok", None)),
+        ("omarchy.image-picker", "cancel") => {
+            finish_done_file(arg)?;
+            runtime.open_panel_ids.remove(&id);
+            Ok(outcome("ok", Some(IpcEvent::Hide { id })))
+        }
         _ => Ok(outcome("unknown", None)),
     };
     result
@@ -1191,6 +1271,40 @@ fn decode_base64(raw: &str) -> Vec<u8> {
     bytes
 }
 
+fn decode_utf8(raw: String) -> String {
+    String::from_utf8_lossy(&decode_base64(&raw)).into_owned()
+}
+
+fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("{program} exited with {}", output.status)
+        } else {
+            format!("{program}: {detail}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn finish_done_file(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Ok(());
+    }
+    let target = PathBuf::from(path);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&target)
+        .map(|_| ())
+        .map_err(|error| format!("finish image selector file {}: {error}", target.display()))
+}
+
 fn base64_value(value: u8) -> Option<u8> {
     match value {
         b'A'..=b'Z' => Some(value - b'A'),
@@ -1205,6 +1319,12 @@ fn base64_value(value: u8) -> Option<u8> {
 fn required(args: &[String], index: usize, label: &str) -> Result<String, String> {
     args.get(index)
         .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("missing {label}"))
+}
+
+fn positional(args: &[String], index: usize, label: &str) -> Result<String, String> {
+    args.get(index)
         .cloned()
         .ok_or_else(|| format!("missing {label}"))
 }
@@ -1233,6 +1353,38 @@ mod tests {
                 enabled: false,
             })
         );
+    }
+
+    #[test]
+    fn parses_direct_service_and_image_selector_targets() {
+        assert_eq!(
+            parse(&args(&["lock", "lock"])),
+            Ok(ShellCommand::Call {
+                id: "lock".to_string(),
+                method: "lock".to_string(),
+                arg: String::new(),
+            })
+        );
+
+        let parsed = parse(&args(&[
+            "image-selector",
+            "open",
+            "/tmp/images",
+            "SGVsbG8=",
+            "selected.png",
+            "/tmp/selection",
+            "/tmp/done",
+            "true",
+            "false",
+        ]))
+        .unwrap();
+        let ShellCommand::ImageSelectorOpen { payload } = parsed else {
+            panic!("expected image selector open");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["imageDirs"], "/tmp/images");
+        assert_eq!(payload["imageRows"], "Hello");
+        assert_eq!(payload["filterable"], "false");
     }
 
     #[test]

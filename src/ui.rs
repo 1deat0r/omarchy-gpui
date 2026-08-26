@@ -208,12 +208,13 @@ impl ShellView {
                 ..Default::default()
             },
             move |_, cx| {
-                cx.new(|_| {
+                cx.new(|cx| {
                     PanelView::new(
                         panel_id.clone(),
                         panel_state,
                         &panel_payload,
                         panel_snapshot,
+                        cx,
                     )
                 })
             },
@@ -337,9 +338,47 @@ struct PanelView {
 }
 
 impl PanelView {
-    fn new(id: String, system: SystemSnapshot, payload: &str, snapshot: ShellSnapshot) -> Self {
+    fn new(
+        id: String,
+        system: SystemSnapshot,
+        payload: &str,
+        snapshot: ShellSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let menu = (id == "omarchy.menu").then(MenuModel::load);
         let (overlay_rows, overlay_filterable) = overlay_rows_for(&id, payload, &snapshot);
+        let refresh_id = id.clone();
+        let refresh_snapshot = snapshot.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let system = cx
+                    .background_executor()
+                    .spawn(async { SystemSnapshot::collect() })
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.system = system;
+                        if is_fullscreen_overlay(&refresh_id) && refresh_id != "omarchy.reminders" {
+                            let (rows, filterable) =
+                                overlay_rows_for(&refresh_id, "{}", &refresh_snapshot);
+                            if !rows.is_empty() || refresh_id == "omarchy.clipboard" {
+                                view.overlay_rows = rows;
+                                view.overlay_filterable = filterable;
+                                if view.selected_menu_index >= view.overlay_rows.len() {
+                                    view.selected_menu_index = 0;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+            }
+        })
+        .detach();
         let active_menu = menu
             .as_ref()
             .and_then(|_| serde_json::from_str::<serde_json::Value>(payload).ok())
