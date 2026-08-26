@@ -81,7 +81,6 @@ pub enum SystemAction {
     },
     SetNetworkBand(String),
     SetNightlight(bool),
-    ToggleNightlight,
     BluetoothDevice {
         action: BluetoothDeviceAction,
         address: String,
@@ -185,7 +184,6 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             command("omarchy-network-band", &[band]).map(|_| ())
         }
         SystemAction::SetNightlight(enabled) => set_nightlight(*enabled),
-        SystemAction::ToggleNightlight => command("omarchy-toggle-nightlight", &[]).map(|_| ()),
         SystemAction::BluetoothDevice { action, address } => {
             validate_bluetooth_address(address)?;
             let command_name = match action {

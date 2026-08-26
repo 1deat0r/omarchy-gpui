@@ -490,8 +490,18 @@ struct PanelView {
     dmenu: Option<DmenuRequest>,
     qr_meta: String,
     qr_lines: Vec<String>,
+    osd_icon: String,
+    osd_message: String,
+    notification_entries: Vec<NotificationEntry>,
     reminder_minutes: String,
     reminder_step_message: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NotificationEntry {
+    app: String,
+    summary: String,
+    body: String,
 }
 
 impl PanelView {
@@ -513,6 +523,8 @@ impl PanelView {
         } else {
             (String::new(), Vec::new())
         };
+        let (osd_icon, osd_message) = parse_osd_payload(payload);
+        let notification_entries = parse_notification_history(payload);
         let refresh_id = id.clone();
         let refresh_snapshot = snapshot.clone();
         let refresh_plugin_path = snapshot.omarchy_path.clone();
@@ -612,6 +624,9 @@ impl PanelView {
             dmenu,
             qr_meta,
             qr_lines,
+            osd_icon,
+            osd_message,
+            notification_entries,
             reminder_minutes: String::new(),
             reminder_step_message: false,
         }
@@ -758,6 +773,9 @@ impl PanelView {
                     .child(self.action_button("Previous", SystemAction::MediaPrevious, cx))
                     .child(self.action_button("Play/Pause", SystemAction::MediaPlayPause, cx))
                     .child(self.action_button("Next", SystemAction::MediaNext, cx));
+                actions = actions
+                    .child(self.ipc_button("Source previous", &["media", "sourcePrevious"], cx))
+                    .child(self.ipc_button("Source next", &["media", "sourceNext"], cx));
             }
             "omarchy.network" => {
                 if !self.system.network.connection.is_empty()
@@ -838,7 +856,7 @@ impl PanelView {
                         .child(self.action_button("Text 12px", SystemAction::SetTextSize(12), cx));
                     actions = actions.child(self.action_button(
                         "Toggle nightlight",
-                        SystemAction::ToggleNightlight,
+                        SystemAction::SetNightlight(!self.system.nightlight.active),
                         cx,
                     ));
                 }
@@ -852,7 +870,7 @@ impl PanelView {
                         &action_label,
                         SystemAction::ToggleDisplay {
                             name: display.name.clone(),
-                            enabled: display.enabled,
+                            enabled: !display.enabled,
                         },
                         cx,
                     ));
@@ -918,6 +936,34 @@ impl PanelView {
                     cx,
                 ));
             }
+            "omarchy.notifications" => {
+                actions = actions
+                    .child(self.ipc_button("Clear history", &["notifications", "clear"], cx))
+                    .child(self.ipc_button("Dismiss all", &["notifications", "dismissAll"], cx));
+            }
+            "omarchy.disk-speedtest" => {
+                actions = actions.child(self.command_button(
+                    "Run disk test",
+                    "omarchy-disk-speedtest",
+                    &[],
+                    cx,
+                ));
+            }
+            "omarchy.speedtest" => {
+                actions = actions
+                    .child(self.command_button(
+                        "Download test",
+                        "omarchy-network-speedtest",
+                        &["down"],
+                        cx,
+                    ))
+                    .child(self.command_button(
+                        "Upload test",
+                        "omarchy-network-speedtest",
+                        &["up"],
+                        cx,
+                    ));
+            }
             "omarchy.weather" => {
                 actions = actions
                     .child(self.command_button(
@@ -936,6 +982,36 @@ impl PanelView {
             _ => {}
         }
         actions
+    }
+
+    fn ipc_button(&self, label: &str, args: &[&str], cx: &mut Context<Self>) -> Stateful<Div> {
+        let id = format!(
+            "omarchy-gpui-ipc-{}",
+            label.to_lowercase().replace(' ', "-")
+        );
+        let executable =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x27272a))
+            .border_1()
+            .border_color(rgb(0x3f3f46))
+            .child(label.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.message = match Command::new(&executable).args(&args).spawn() {
+                    Ok(_) => "IPC action started".to_string(),
+                    Err(error) => format!("{}: {error}", executable.display()),
+                };
+                cx.notify();
+            }))
     }
 
     fn is_overlay(&self) -> bool {
@@ -1705,6 +1781,78 @@ impl PanelView {
     }
 }
 
+impl PanelView {
+    fn notification_content(&self) -> Div {
+        let mut rows = div().flex().flex_col().gap_2().mt_3();
+        if self.notification_entries.is_empty() {
+            return rows.child(
+                div()
+                    .text_color(rgb(0xa1a1aa))
+                    .child("No recent notifications"),
+            );
+        }
+        for entry in &self.notification_entries {
+            let heading = if entry.app.is_empty() {
+                entry.summary.clone()
+            } else if entry.summary.is_empty() {
+                entry.app.clone()
+            } else {
+                format!("{} · {}", entry.app, entry.summary)
+            };
+            rows = rows.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(0x27272a))
+                    .border_1()
+                    .border_color(rgb(0x3f3f46))
+                    .child(heading)
+                    .when(!entry.body.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .mt_1()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0xa1a1aa))
+                                .child(entry.body.clone()),
+                        )
+                    }),
+            );
+        }
+        rows
+    }
+
+    fn osd_content(&self) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .mt_3()
+            .child(
+                div()
+                    .text_size(px(36.0))
+                    .child(if self.osd_icon.is_empty() {
+                        "󰎆".to_string()
+                    } else {
+                        self.osd_icon.clone()
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .child(if self.osd_message.is_empty() {
+                        "OSD".to_string()
+                    } else {
+                        self.osd_message.clone()
+                    }),
+            )
+    }
+}
+
 impl Render for PanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
@@ -1730,6 +1878,10 @@ impl Render for PanelView {
             self.menu_content(cx)
         } else if self.id == "omarchy.wifiqr" {
             self.wifi_qr_content()
+        } else if self.id == "omarchy.notifications" {
+            self.notification_content()
+        } else if self.id == "omarchy.osd" {
+            self.osd_content()
         } else if self.is_overlay() {
             self.overlay_content(cx)
         } else {
@@ -1900,6 +2052,54 @@ fn overlay_rows_for(id: &str, payload: &str, snapshot: &ShellSnapshot) -> (Vec<O
         }
         _ => (Vec::new(), false),
     }
+}
+
+fn parse_osd_payload(payload: &str) -> (String, String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return (String::new(), String::new());
+    };
+    (
+        value
+            .get("icon")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+fn parse_notification_history(payload: &str) -> Vec<NotificationEntry> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(NotificationEntry {
+                app: entry
+                    .get("app")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                summary: entry
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                body: entry
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 fn wifi_qr_payload(snapshot: &ShellSnapshot) -> (String, Vec<String>) {
@@ -2090,6 +2290,68 @@ fn panel_rows(
             "Monitor".to_string(),
             display_or_dash(&system.hyprland.monitor),
         )],
+        "omarchy.indicators" => vec![
+            (
+                "Night light".to_string(),
+                if system.nightlight.active {
+                    "active".to_string()
+                } else {
+                    "inactive".to_string()
+                },
+            ),
+            ("DND".to_string(), "service-backed".to_string()),
+            (
+                "Stay awake".to_string(),
+                if plugins.idle.stay_awake {
+                    "active".to_string()
+                } else {
+                    "inactive".to_string()
+                },
+            ),
+        ],
+        "omarchy.battery" => vec![
+            (
+                "Percentage".to_string(),
+                system
+                    .battery
+                    .percentage
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "Unavailable".to_string()),
+            ),
+            ("State".to_string(), display_or_dash(&system.battery.state)),
+            ("Charging".to_string(), yes_no(system.battery.charging)),
+        ],
+        "omarchy.idle" => vec![
+            ("Enabled".to_string(), yes_no(plugins.idle.enabled)),
+            ("Stay awake".to_string(), yes_no(plugins.idle.stay_awake)),
+            (
+                "State file".to_string(),
+                display_or_dash(&plugins.idle.state_path.display().to_string()),
+            ),
+        ],
+        "omarchy.nightlight" => vec![
+            ("Enabled".to_string(), yes_no(system.nightlight.active)),
+            (
+                "Temperature".to_string(),
+                system
+                    .nightlight
+                    .temperature
+                    .map(|value| format!("{value}K"))
+                    .unwrap_or_else(|| "Unavailable".to_string()),
+            ),
+        ],
+        "omarchy.dev-gallery" => vec![
+            ("Surface".to_string(), "GPUI component gallery".to_string()),
+            ("Status".to_string(), "available".to_string()),
+        ],
+        "omarchy.disk-speedtest" => vec![
+            ("Tool".to_string(), "omarchy-disk-speedtest".to_string()),
+            ("Status".to_string(), "idle until requested".to_string()),
+        ],
+        "omarchy.speedtest" => vec![
+            ("Tool".to_string(), "omarchy-network-speedtest".to_string()),
+            ("Status".to_string(), "idle until requested".to_string()),
+        ],
         "omarchy.agents" => vec![
             (
                 "Default agent".to_string(),
@@ -2371,7 +2633,7 @@ fn label_for(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{menu_label, menu_matches_filter};
+    use super::{menu_label, menu_matches_filter, parse_notification_history, parse_osd_payload};
     use crate::menu::{MenuItem, MenuItemKind};
 
     #[test]
@@ -2396,6 +2658,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(menu_label(&item), "Performance  ✓");
+    }
+
+    #[test]
+    fn parses_osd_and_notification_payloads_without_inventing_rows() {
+        assert_eq!(
+            parse_osd_payload(r#"{"icon":"volume","message":"50%"}"#),
+            ("volume".to_string(), "50%".to_string())
+        );
+        let notifications =
+            parse_notification_history(r#"[{"app":"mail","summary":"New mail","body":"Hello"}]"#);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].app, "mail");
+        assert!(parse_notification_history("not-json").is_empty());
     }
 }
 
