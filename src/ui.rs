@@ -5,9 +5,9 @@ use std::{
 };
 
 use gpui::{
-    AppContext, Bounds, Context, Div, Render, Stateful, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, layer_shell::*, point, prelude::*,
-    px, rgb, rgba, size,
+    AppContext, Bounds, Context, Div, KeyDownEvent, Render, Stateful, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
+    layer_shell::*, point, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::config::{BarEntry, ShellSnapshot};
@@ -283,6 +283,8 @@ struct PanelView {
     menu: Option<MenuModel>,
     active_menu: String,
     menu_children: BTreeMap<String, Vec<MenuItem>>,
+    filter_text: String,
+    selected_menu_index: usize,
 }
 
 impl PanelView {
@@ -311,6 +313,8 @@ impl PanelView {
             menu,
             active_menu,
             menu_children: BTreeMap::new(),
+            filter_text: String::new(),
+            selected_menu_index: 0,
         }
     }
 
@@ -454,15 +458,23 @@ impl PanelView {
             return div();
         };
         let active_menu = self.active_menu.clone();
-        let items = self
-            .menu_children
-            .entry(active_menu.clone())
-            .or_insert_with(|| model.children_with_providers(&active_menu))
-            .clone()
-            .into_iter()
-            .filter(|item| MenuModel::evaluate_guard(&item.when))
-            .collect::<Vec<_>>();
+        let items = self.visible_menu_items(&model);
         let mut content = div().flex().flex_col().gap_1().mt_3();
+
+        content = content.child(
+            div()
+                .id("omarchy-gpui-menu-search")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x27272a))
+                .text_color(rgb(0xa1a1aa))
+                .child(if self.filter_text.is_empty() {
+                    "Type to search…".to_string()
+                } else {
+                    format!("Search: {}", self.filter_text)
+                }),
+        );
 
         if active_menu != "root" {
             let parent = model
@@ -484,7 +496,7 @@ impl PanelView {
             );
         }
 
-        for item in items {
+        for (index, item) in items.into_iter().enumerate() {
             let item_id = item.id.clone();
             let label = menu_label(&item);
             let description = item.description.clone();
@@ -496,7 +508,11 @@ impl PanelView {
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(0x27272a))
+                .bg(if index == self.selected_menu_index {
+                    rgb(0x3f3f46)
+                } else {
+                    rgb(0x27272a)
+                })
                 .border_1()
                 .border_color(rgb(0x3f3f46))
                 .child(label)
@@ -517,6 +533,104 @@ impl PanelView {
         content
     }
 
+    fn visible_menu_items(&mut self, model: &MenuModel) -> Vec<MenuItem> {
+        let active_menu = self.active_menu.clone();
+        let items = self
+            .menu_children
+            .entry(active_menu.clone())
+            .or_insert_with(|| model.children_with_providers(&active_menu))
+            .clone()
+            .into_iter()
+            .filter(|item| MenuModel::evaluate_guard(&item.when))
+            .filter(|item| menu_matches_filter(item, &self.filter_text))
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.selected_menu_index = 0;
+        } else if self.selected_menu_index >= items.len() {
+            self.selected_menu_index = items.len() - 1;
+        }
+        items
+    }
+
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(model) = self.menu.clone() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                window.remove_window();
+                return;
+            }
+            "backspace" => {
+                if self.filter_text.is_empty() {
+                    if let Some(parent) = model.parent(&self.active_menu) {
+                        self.active_menu = parent;
+                        self.selected_menu_index = 0;
+                    }
+                } else {
+                    self.filter_text.pop();
+                    self.selected_menu_index = 0;
+                }
+                cx.notify();
+                return;
+            }
+            "up" | "k" => {
+                self.move_menu_selection(-1, &model);
+                cx.notify();
+                return;
+            }
+            "down" | "j" => {
+                self.move_menu_selection(1, &model);
+                cx.notify();
+                return;
+            }
+            "enter" | "return" => {
+                let items = self.visible_menu_items(&model);
+                if let Some(item) = items.get(self.selected_menu_index) {
+                    self.activate_menu_item(&item.id, window, cx);
+                }
+                return;
+            }
+            "left" | "h" if self.filter_text.is_empty() => {
+                if let Some(parent) = model.parent(&self.active_menu) {
+                    self.active_menu = parent;
+                    self.selected_menu_index = 0;
+                    cx.notify();
+                }
+                return;
+            }
+            _ => {}
+        }
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+        {
+            return;
+        }
+        if let Some(character) = event
+            .keystroke
+            .key_char
+            .as_deref()
+            .or_else(|| (!key.is_empty() && key.chars().count() == 1).then_some(key))
+            && !character.chars().any(char::is_control)
+        {
+            self.filter_text.push_str(character);
+            self.selected_menu_index = 0;
+            cx.notify();
+        }
+    }
+
+    fn move_menu_selection(&mut self, delta: i32, model: &MenuModel) {
+        let count = self.visible_menu_items(model).len();
+        if count == 0 {
+            self.selected_menu_index = 0;
+            return;
+        }
+        let next = self.selected_menu_index as i32 + delta;
+        self.selected_menu_index = next.clamp(0, count as i32 - 1) as usize;
+    }
+
     fn activate_menu_item(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let item = self
             .menu
@@ -535,9 +649,13 @@ impl PanelView {
         match item.kind {
             MenuItemKind::Menu => {
                 self.active_menu = item.id;
+                self.filter_text.clear();
+                self.selected_menu_index = 0;
             }
             MenuItemKind::Link => {
                 self.active_menu = item.target;
+                self.filter_text.clear();
+                self.selected_menu_index = 0;
             }
             MenuItemKind::Action => match MenuModel::run_action(&item.action) {
                 Ok(()) => {
@@ -592,6 +710,7 @@ impl Render for PanelView {
             .p_5()
             .bg(rgb(0x18181b))
             .text_color(rgb(0xf4f4f5))
+            .on_key_down(cx.listener(Self::handle_key))
             .child(
                 div()
                     .flex()
@@ -655,6 +774,23 @@ fn menu_label(item: &MenuItem) -> String {
     } else {
         label
     }
+}
+
+fn menu_matches_filter(item: &MenuItem, filter: &str) -> bool {
+    let query = filter.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {} {} {}",
+        item.id,
+        item.label,
+        item.title,
+        item.description,
+        item.aliases.join(" ")
+    )
+    .to_lowercase();
+    query.split_whitespace().all(|term| haystack.contains(term))
 }
 
 fn panel_rows(id: &str, system: &SystemSnapshot) -> Vec<(String, String)> {
@@ -881,6 +1017,36 @@ fn label_for(id: &str) -> &str {
         "omarchy.monitor" => "MONITOR",
         "omarchy.power" => "POWER",
         other => other.strip_prefix("omarchy.").unwrap_or(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{menu_label, menu_matches_filter};
+    use crate::menu::{MenuItem, MenuItemKind};
+
+    #[test]
+    fn menu_search_matches_aliases_and_multiple_terms() {
+        let item = MenuItem {
+            id: "system.lock".to_string(),
+            kind: MenuItemKind::Action,
+            label: "Lock Screen".to_string(),
+            aliases: vec!["secure".to_string()],
+            ..Default::default()
+        };
+        assert!(menu_matches_filter(&item, "secure screen"));
+        assert!(menu_matches_filter(&item, ""));
+        assert!(!menu_matches_filter(&item, "bluetooth"));
+    }
+
+    #[test]
+    fn checked_menu_rows_keep_the_reference_mark() {
+        let item = MenuItem {
+            label: "Performance".to_string(),
+            checked: "true".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(menu_label(&item), "Performance  ✓");
     }
 }
 
