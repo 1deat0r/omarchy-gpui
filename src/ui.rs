@@ -21,11 +21,13 @@ use crate::overlays::{
     emoji_rows_from_path, image_rows_from_payload, parse_image_picker_payload, reminder_args,
     valid_reminder_minutes,
 };
+use crate::plugins::PluginSnapshot;
 use crate::system::{BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action};
 
 pub struct ShellView {
     snapshot: ShellSnapshot,
     system: SystemSnapshot,
+    plugins: PluginSnapshot,
     clock: String,
     smoke: bool,
     reported_first_frame: bool,
@@ -66,6 +68,30 @@ impl ShellView {
         })
         .detach();
 
+        let plugin_path = snapshot.omarchy_path.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let path = plugin_path.clone();
+                let plugins = cx
+                    .background_executor()
+                    .spawn(async move { PluginSnapshot::collect(&path) })
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.plugins = plugins;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+            }
+        })
+        .detach();
+
         cx.spawn(async move |this, cx| {
             loop {
                 let (snapshot, system) = cx
@@ -91,6 +117,7 @@ impl ShellView {
         Self {
             snapshot,
             system: SystemSnapshot::default(),
+            plugins: PluginSnapshot::default(),
             clock: local_clock(),
             smoke,
             reported_first_frame: false,
@@ -103,6 +130,7 @@ impl ShellView {
         entries: &[BarEntry],
         clock: &str,
         system: &SystemSnapshot,
+        plugins: &PluginSnapshot,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut group = div().flex().items_center().gap_1();
@@ -129,9 +157,22 @@ impl ShellView {
                 }
                 continue;
             }
-            let label = label_for_entry(entry, clock, system);
+            if !entry_visible(entry, plugins, system) {
+                continue;
+            }
+            let label = label_for_entry(entry, clock, system, plugins);
             let _settings_are_preserved = &entry.settings;
             let id = entry.id.clone();
+            if id == "omarchy.spacer" {
+                let span = entry
+                    .settings
+                    .get("size")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(12.0)
+                    .max(1.0);
+                group = group.child(div().w(px(span as f32)).h(px(1.0)));
+                continue;
+            }
             group = group.child(Self::chip(&label, &entry.id).when(
                 is_panel_capable(&id),
                 |chip| {
@@ -157,6 +198,7 @@ impl ShellView {
     fn open_panel(&mut self, id: &str, payload: &str, cx: &mut Context<Self>) {
         let panel_id = id.to_string();
         let panel_state = self.system.clone();
+        let panel_plugins = self.plugins.clone();
         let panel_payload = payload.to_string();
         let panel_snapshot = self.snapshot.clone();
         let fullscreen_overlay = is_fullscreen_overlay(&panel_id);
@@ -212,6 +254,7 @@ impl ShellView {
                     PanelView::new(
                         panel_id.clone(),
                         panel_state,
+                        panel_plugins,
                         &panel_payload,
                         panel_snapshot,
                         cx,
@@ -304,18 +347,21 @@ impl Render for ShellView {
                 &self.snapshot.left,
                 &self.clock,
                 &self.system,
+                &self.plugins,
                 cx,
             ))
             .child(div().flex_1().flex().justify_center().child(Self::group(
                 &self.snapshot.center,
                 &self.clock,
                 &self.system,
+                &self.plugins,
                 cx,
             )))
             .child(div().flex().justify_end().child(Self::group(
                 &self.snapshot.right,
                 &self.clock,
                 &self.system,
+                &self.plugins,
                 cx,
             )))
     }
@@ -325,6 +371,7 @@ struct PanelView {
     id: String,
     omarchy_path: PathBuf,
     system: SystemSnapshot,
+    plugins: PluginSnapshot,
     message: String,
     menu: Option<MenuModel>,
     active_menu: String,
@@ -341,6 +388,7 @@ impl PanelView {
     fn new(
         id: String,
         system: SystemSnapshot,
+        plugins: PluginSnapshot,
         payload: &str,
         snapshot: ShellSnapshot,
         cx: &mut Context<Self>,
@@ -349,6 +397,7 @@ impl PanelView {
         let (overlay_rows, overlay_filterable) = overlay_rows_for(&id, payload, &snapshot);
         let refresh_id = id.clone();
         let refresh_snapshot = snapshot.clone();
+        let refresh_plugin_path = snapshot.omarchy_path.clone();
         cx.spawn(async move |this, cx| {
             loop {
                 let system = cx
@@ -379,6 +428,28 @@ impl PanelView {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let path = refresh_plugin_path.clone();
+                let plugins = cx
+                    .background_executor()
+                    .spawn(async move { PluginSnapshot::collect(&path) })
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.plugins = plugins;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+            }
+        })
+        .detach();
         let active_menu = menu
             .as_ref()
             .and_then(|_| serde_json::from_str::<serde_json::Value>(payload).ok())
@@ -399,6 +470,7 @@ impl PanelView {
             id,
             omarchy_path: snapshot.omarchy_path,
             system,
+            plugins,
             message: String::new(),
             menu,
             active_menu,
@@ -443,6 +515,50 @@ impl PanelView {
             .on_click(cx.listener(move |view, _, _, cx| {
                 view.execute(action.clone(), cx);
             }))
+    }
+
+    fn command_button(
+        &self,
+        label: &str,
+        program: &str,
+        args: &[&str],
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let id = format!(
+            "omarchy-gpui-command-{}",
+            label.to_lowercase().replace(' ', "-")
+        );
+        let program = self.omarchy_program(program);
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x27272a))
+            .border_1()
+            .border_color(rgb(0x3f3f46))
+            .child(label.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.message = match Command::new(&program).args(&args).spawn() {
+                    Ok(_) => "Action started".to_string(),
+                    Err(error) => format!("{}: {error}", program.display()),
+                };
+                cx.notify();
+            }))
+    }
+
+    fn omarchy_program(&self, command: &str) -> PathBuf {
+        let bundled = self.omarchy_path.join("bin").join(command);
+        if bundled.is_file() {
+            bundled
+        } else {
+            PathBuf::from(command)
+        }
     }
 
     fn actions(&self, cx: &mut Context<Self>) -> Div {
@@ -620,6 +736,69 @@ impl PanelView {
                         cx,
                     ));
                 }
+            }
+            "omarchy.agents" => {
+                actions = actions
+                    .child(self.command_button("Launch agent", "omarchy-agent", &["--pick"], cx))
+                    .child(self.command_button(
+                        "Refresh usage",
+                        "omarchy-agent-usage-update",
+                        &["--force"],
+                        cx,
+                    ));
+            }
+            "omarchy.dropbox" => {
+                if self.plugins.dropbox.installed {
+                    actions = actions.child(if self.plugins.dropbox.running {
+                        self.command_button("Pause syncing", "dropbox-cli", &["stop"], cx)
+                    } else {
+                        self.command_button("Resume syncing", "dropbox-cli", &["start"], cx)
+                    });
+                    actions = actions.child(self.command_button(
+                        "Start or login",
+                        "dropbox-cli",
+                        &["start"],
+                        cx,
+                    ));
+                }
+            }
+            "omarchy.tailscale" => {
+                if self.plugins.tailscale.installed {
+                    actions = actions.child(if self.plugins.tailscale.running {
+                        self.command_button("Disconnect", "tailscale", &["down"], cx)
+                    } else {
+                        self.command_button("Connect", "tailscale", &["up"], cx)
+                    });
+                    actions = actions.child(self.command_button(
+                        "Refresh status",
+                        "tailscale",
+                        &["status", "--json"],
+                        cx,
+                    ));
+                }
+            }
+            "omarchy.system-update" => {
+                actions = actions.child(self.command_button(
+                    "Open updater",
+                    "omarchy-launch-floating-terminal-with-presentation",
+                    &["omarchy-update"],
+                    cx,
+                ));
+            }
+            "omarchy.weather" => {
+                actions = actions
+                    .child(self.command_button(
+                        "Refresh weather",
+                        "omarchy-weather-status",
+                        &[],
+                        cx,
+                    ))
+                    .child(self.command_button(
+                        "Auto location",
+                        "omarchy-weather-location",
+                        &["--clear"],
+                        cx,
+                    ));
             }
             _ => {}
         }
@@ -1170,7 +1349,7 @@ impl Render for PanelView {
             self.overlay_content(cx)
         } else {
             let mut rows = div().flex().flex_col().gap_2().mt_3();
-            for (label, value) in panel_rows(&self.id, &self.system) {
+            for (label, value) in panel_rows(&self.id, &self.system, &self.plugins) {
                 rows = rows.child(
                     div()
                         .flex()
@@ -1387,7 +1566,11 @@ fn menu_matches_filter(item: &MenuItem, filter: &str) -> bool {
     query.split_whitespace().all(|term| haystack.contains(term))
 }
 
-fn panel_rows(id: &str, system: &SystemSnapshot) -> Vec<(String, String)> {
+fn panel_rows(
+    id: &str,
+    system: &SystemSnapshot,
+    plugins: &PluginSnapshot,
+) -> Vec<(String, String)> {
     match id {
         "omarchy.audio" => vec![
             (
@@ -1485,6 +1668,67 @@ fn panel_rows(id: &str, system: &SystemSnapshot) -> Vec<(String, String)> {
             "Monitor".to_string(),
             display_or_dash(&system.hyprland.monitor),
         )],
+        "omarchy.agents" => vec![
+            (
+                "Default agent".to_string(),
+                display_or_dash(&plugins.agents.default_agent),
+            ),
+            (
+                "Usage adapter".to_string(),
+                if plugins.agents.available {
+                    "available".to_string()
+                } else {
+                    "unavailable".to_string()
+                },
+            ),
+        ],
+        "omarchy.keyboard-layout" => vec![
+            (
+                "Layout".to_string(),
+                display_or_dash(&plugins.keyboard.layout_full),
+            ),
+            (
+                "Keyboard".to_string(),
+                display_or_dash(&plugins.keyboard.keyboard_name),
+            ),
+            (
+                "Layouts".to_string(),
+                yes_no(plugins.keyboard.multiple_layouts),
+            ),
+        ],
+        "omarchy.weather" => vec![
+            (
+                "Location".to_string(),
+                display_or_dash(&plugins.weather.location),
+            ),
+            (
+                "Report".to_string(),
+                display_or_dash(&plugins.weather.status),
+            ),
+        ],
+        "omarchy.system-update" => vec![
+            ("Available".to_string(), yes_no(plugins.update.available)),
+            (
+                "Detail".to_string(),
+                display_or_dash(&plugins.update.detail),
+            ),
+        ],
+        "omarchy.dropbox" => vec![
+            ("Installed".to_string(), yes_no(plugins.dropbox.installed)),
+            ("Running".to_string(), yes_no(plugins.dropbox.running)),
+        ],
+        "omarchy.tailscale" => vec![
+            ("Installed".to_string(), yes_no(plugins.tailscale.installed)),
+            (
+                "State".to_string(),
+                display_or_dash(&plugins.tailscale.status),
+            ),
+            (
+                "Self".to_string(),
+                display_or_dash(&plugins.tailscale.self_name),
+            ),
+            ("Peers".to_string(), plugins.tailscale.peers.to_string()),
+        ],
         _ => vec![("State".to_string(), "GPUI adapter active".to_string())],
     }
 }
@@ -1505,7 +1749,37 @@ fn yes_no(value: bool) -> String {
     }
 }
 
-fn label_for_entry(entry: &BarEntry, clock: &str, system: &SystemSnapshot) -> String {
+fn entry_visible(entry: &BarEntry, plugins: &PluginSnapshot, system: &SystemSnapshot) -> bool {
+    match entry.id.as_str() {
+        "omarchy.keyboard-layout" => {
+            plugins.keyboard.available && plugins.keyboard.multiple_layouts
+        }
+        "omarchy.system-update" => plugins.update.available,
+        "omarchy.weather" => plugins.weather.available,
+        "omarchy.media" => {
+            system.media.available
+                && (!system.media.title.is_empty() || !system.media.artist.is_empty())
+        }
+        "omarchy.tailscale" => plugins.tailscale.installed,
+        "omarchy.dropbox" => plugins.dropbox.installed,
+        "omarchy.spacer" => {
+            entry
+                .settings
+                .get("size")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(12.0)
+                > 0.0
+        }
+        _ => true,
+    }
+}
+
+fn label_for_entry(
+    entry: &BarEntry,
+    clock: &str,
+    system: &SystemSnapshot,
+    plugins: &PluginSnapshot,
+) -> String {
     match entry.id.as_str() {
         "omarchy.clock" => clock.to_string(),
         "omarchy.workspaces" => {
@@ -1581,6 +1855,44 @@ fn label_for_entry(entry: &BarEntry, clock: &str, system: &SystemSnapshot) -> St
                     &format!("{} — {}", system.media.artist, system.media.title),
                     28,
                 )
+            }
+        }
+        "omarchy.agents" => {
+            if plugins.agents.available {
+                format!("AGENT {}", plugins.agents.default_agent.to_uppercase())
+            } else {
+                "AGENTS".to_string()
+            }
+        }
+        "omarchy.keyboard-layout" => {
+            if plugins.keyboard.layout_label.is_empty() {
+                "KEYBOARD".to_string()
+            } else {
+                plugins.keyboard.layout_label.clone()
+            }
+        }
+        "omarchy.weather" => {
+            if plugins.weather.status.is_empty() {
+                "WEATHER".to_string()
+            } else {
+                truncate(&plugins.weather.status, 32)
+            }
+        }
+        "omarchy.system-update" => "UPDATE".to_string(),
+        "omarchy.dropbox" => {
+            if plugins.dropbox.running {
+                "DROPBOX".to_string()
+            } else {
+                "DROPBOX OFF".to_string()
+            }
+        }
+        "omarchy.tailscale" => {
+            if plugins.tailscale.running {
+                "TAILSCALE".to_string()
+            } else if plugins.tailscale.needs_login {
+                "TAILSCALE LOGIN".to_string()
+            } else {
+                "TAILSCALE OFF".to_string()
             }
         }
         _ => label_for(&entry.id).to_string(),

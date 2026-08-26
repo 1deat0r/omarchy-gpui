@@ -2,6 +2,7 @@ mod config;
 mod ipc;
 mod menu;
 mod overlays;
+mod plugins;
 mod system;
 mod ui;
 
@@ -23,6 +24,7 @@ fn main() {
         Some("--help") | Some("-h") => print_help(),
         Some("--print-contract") => print_contract(&snapshot),
         Some("--print-system") => print_system(),
+        Some("--print-plugins") => print_plugins(&snapshot),
         Some("--print-menu") => print_menu(),
         Some("--smoke") => run_shell(snapshot, true),
         Some(target) if target == "shell" || !target.starts_with('-') => match ipc::parse(&args) {
@@ -75,6 +77,12 @@ fn print_system() {
     let system = system::SystemSnapshot::collect();
     println!("system={}", system::to_value(&system));
     println!("OMARCHY_GPUI_SYSTEM_RUNTIME_OK");
+}
+
+fn print_plugins(snapshot: &ShellSnapshot) {
+    let plugins = plugins::PluginSnapshot::collect(&snapshot.omarchy_path);
+    println!("plugins={plugins:#?}");
+    println!("OMARCHY_GPUI_PLUGIN_RUNTIME_OK");
 }
 
 fn print_menu() {
