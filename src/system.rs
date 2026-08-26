@@ -9,7 +9,11 @@
 
 use std::{
     collections::BTreeSet,
+    io::{BufRead, BufReader},
+    path::PathBuf,
     process::Command,
+    sync::mpsc::{self, Receiver},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -49,6 +53,43 @@ impl SystemSnapshot {
                 .as_secs(),
         }
     }
+}
+
+/// Subscribe to Hyprland's raw event socket. The reference shell receives
+/// these events from Quickshell and uses them to update active windows,
+/// workspaces, monitors, and service state without waiting for a polling
+/// timer. The reconnect loop intentionally treats compositor restarts as a
+/// normal lifecycle event.
+pub fn subscribe_hyprland_events() -> Option<Receiver<String>> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let socket = runtime.join("hypr").join(signature).join(".socket2.sock");
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("omarchy-gpui-hyprland-events".to_string())
+        .spawn(move || {
+            loop {
+                let stream = match std::os::unix::net::UnixStream::connect(&socket) {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        thread::sleep(std::time::Duration::from_millis(250));
+                        continue;
+                    }
+                };
+                let reader = BufReader::new(stream);
+                for line in reader.lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    if sender.send(line).is_err() {
+                        return;
+                    }
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+        .ok()?;
+    Some(receiver)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

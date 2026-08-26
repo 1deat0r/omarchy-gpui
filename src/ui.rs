@@ -22,7 +22,9 @@ use crate::overlays::{
     valid_reminder_minutes,
 };
 use crate::plugins::{IndicatorState, PluginSnapshot, parse_network_qr};
-use crate::system::{BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action};
+use crate::system::{
+    BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action, subscribe_hyprland_events,
+};
 
 pub struct ShellView {
     snapshot: ShellSnapshot,
@@ -69,6 +71,38 @@ impl ShellView {
             }
         })
         .detach();
+
+        if let Some(receiver) = subscribe_hyprland_events() {
+            let events = Arc::new(std::sync::Mutex::new(receiver));
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let changed = events
+                        .lock()
+                        .map(|receiver| receiver.try_iter().next().is_some())
+                        .unwrap_or(false);
+                    if changed {
+                        let system = cx
+                            .background_executor()
+                            .spawn(async { SystemSnapshot::collect() })
+                            .await;
+                        if this
+                            .update(cx, |view, cx| {
+                                view.system = system;
+                                view.clock = local_clock();
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(40))
+                        .await;
+                }
+            })
+            .detach();
+        }
 
         let plugin_path = snapshot.omarchy_path.clone();
         cx.spawn(async move |this, cx| {
