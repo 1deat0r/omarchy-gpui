@@ -148,6 +148,15 @@ impl NotificationService {
                 .map_err(|error| failed(format!("serialize notification: {error}")))?;
             let _ = state.events.send(IpcEvent::Notification { entry: payload });
         }
+        if let Some((id, path, lifetime)) = result.expiry {
+            let state = Arc::clone(&self.state);
+            thread::spawn(move || {
+                thread::sleep(lifetime);
+                if let Ok(mut state) = state.lock() {
+                    let _ = state.expire(id, &path);
+                }
+            });
+        }
         Ok(result.id)
     }
 
@@ -196,6 +205,7 @@ struct NotificationState {
 struct AcceptedNotification {
     id: u32,
     event: Option<NotificationEntry>,
+    expiry: Option<(u32, PathBuf, Duration)>,
 }
 
 impl NotificationState {
@@ -263,7 +273,14 @@ impl NotificationState {
             Some(entry)
         };
 
-        Ok(AcceptedNotification { id, event })
+        let expiry = event
+            .as_ref()
+            .and_then(notification_lifetime)
+            .map(|lifetime| {
+                let path = self.live.get(&id).cloned().unwrap_or_default();
+                (id, path, lifetime)
+            });
+        Ok(AcceptedNotification { id, event, expiry })
     }
 
     fn close(&mut self, id: u32) -> Result<bool, String> {
@@ -272,6 +289,15 @@ impl NotificationState {
         };
         move_to_history(&self.home, &path)?;
         Ok(true)
+    }
+
+    fn expire(&mut self, id: u32, expected_path: &Path) -> Result<(), String> {
+        if self.live.get(&id).is_some_and(|path| path == expected_path)
+            && let Some(path) = self.live.remove(&id)
+        {
+            move_to_history(&self.home, &path)?;
+        }
+        Ok(())
     }
 
     fn allocate_id(&mut self) -> u32 {
@@ -395,6 +421,20 @@ fn live_path(home: &Path, entry: &NotificationEntry) -> PathBuf {
 
 fn notification_file_name(entry: &NotificationEntry) -> String {
     format!("{}-{}.json", entry.timestamp, entry.original_id)
+}
+
+fn notification_lifetime(entry: &NotificationEntry) -> Option<Duration> {
+    if entry.urgency >= CRITICAL_URGENCY && entry.expire_timeout == 0 {
+        return None;
+    }
+    let milliseconds = if entry.expire_timeout > 0 {
+        u64::from(entry.expire_timeout)
+    } else if entry.urgency == 0 {
+        8_000
+    } else {
+        5_000
+    };
+    Some(Duration::from_millis(milliseconds.clamp(1_000, 20_000)))
 }
 
 fn home_from_config_path(path: &Path) -> PathBuf {

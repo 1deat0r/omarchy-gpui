@@ -20,10 +20,10 @@ stream. DND-silenced non-ephemeral notifications are moved directly into the
 matching `history/` directory. The existing shell IPC history commands read
 the same files.
 
-The adapter is an incremental parity slice, not a completion claim. Toast
-layout, action-button dispatch, expiry-driven archival, image copying, and
-the full notification lifecycle still need differential tests before the
-notifications row or the overall parity contract can be marked complete.
+The adapter is an incremental parity slice, not a completion claim. Full toast
+stacking/layout, D-Bus action-button dispatch, image copying, and the complete
+notification lifecycle still need differential tests before the notifications
+row or the overall parity contract can be marked complete.
 
 ## Isolated runtime check
 

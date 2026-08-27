@@ -37,6 +37,8 @@ pub struct ShellView {
     background_window: Option<WindowHandle<BackgroundView>>,
     panel_id: Option<String>,
     panel_window: Option<WindowHandle<PanelView>>,
+    notification_window: Option<WindowHandle<NotificationPopupView>>,
+    notification_generation: u64,
 }
 
 impl ShellView {
@@ -161,6 +163,8 @@ impl ShellView {
             background_window,
             panel_id: None,
             panel_window: None,
+            notification_window: None,
+            notification_generation: 0,
         }
     }
 
@@ -483,6 +487,72 @@ impl ShellView {
         self.panel_id = None;
     }
 
+    fn close_notification(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.notification_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
+    fn show_notification(&mut self, payload: &str, cx: &mut Context<Self>) {
+        let Some(entry) = parse_notification_history(&format!("[{payload}]"))
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        self.close_notification(cx);
+        self.notification_generation = self.notification_generation.wrapping_add(1);
+        let generation = self.notification_generation;
+        let lifetime = notification_lifetime(&entry);
+        let popup_entry = entry.clone();
+        let Ok(handle) = cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(430.0), px(180.0)),
+                })),
+                app_id: Some("omarchy-gpui-notification".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace: "omarchy-gpui-notifications".to_string(),
+                    layer: Layer::Overlay,
+                    anchor: Anchor::TOP | Anchor::RIGHT,
+                    margin: Some((px(54.0), px(12.0), px(12.0), px(12.0))),
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                focus: false,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| NotificationPopupView::new(popup_entry)),
+        ) else {
+            return;
+        };
+        self.notification_window = Some(handle);
+        if let Some(lifetime) = lifetime {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(lifetime).await;
+                let _ = this.update(cx, |view, cx| {
+                    if view.notification_generation == generation {
+                        view.close_notification(cx);
+                        let executable = std::env::current_exe()
+                            .unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                        let _ = Command::new(executable)
+                            .args(["shell", "call", "notifications", "dismissOne"])
+                            .spawn();
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
     fn apply_ipc_event(&mut self, event: IpcEvent, cx: &mut Context<Self>) {
         match event {
             IpcEvent::Refresh => {}
@@ -517,8 +587,7 @@ impl ShellView {
             }
             IpcEvent::Lock { .. } => {}
             IpcEvent::Notification { entry } => {
-                self.close_panel(cx);
-                self.open_panel("omarchy.notifications", &format!("[{entry}]"), cx);
+                self.show_notification(&entry, cx);
             }
             IpcEvent::NotificationHistory { entries } => {
                 self.close_panel(cx);
@@ -593,6 +662,126 @@ impl Render for ShellView {
     }
 }
 
+struct NotificationPopupView {
+    entry: NotificationEntry,
+}
+
+impl NotificationPopupView {
+    fn new(entry: NotificationEntry) -> Self {
+        Self { entry }
+    }
+}
+
+impl Render for NotificationPopupView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let heading = if self.entry.app.is_empty() {
+            self.entry.summary.clone()
+        } else if self.entry.summary.is_empty() {
+            self.entry.app.clone()
+        } else {
+            format!("{} · {}", self.entry.app, self.entry.summary)
+        };
+        let badge = if self.entry.glyph.is_empty() {
+            self.entry
+                .app_icon
+                .chars()
+                .next()
+                .or_else(|| self.entry.app.chars().next())
+                .unwrap_or('•')
+                .to_string()
+        } else {
+            self.entry.glyph.clone()
+        };
+        let has_open_action = !self.entry.exec_argv.is_empty() || !self.entry.app.is_empty();
+        let mut footer = div().flex().justify_end().gap_2().mt_3();
+        if has_open_action {
+            footer = footer.child(
+                div()
+                    .id("omarchy-gpui-notification-open")
+                    .cursor_pointer()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x3f3f46))
+                    .child("OPEN")
+                    .on_click(|_, window, _| {
+                        let executable = std::env::current_exe()
+                            .unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                        let _ = Command::new(executable)
+                            .args(["shell", "call", "notifications", "invokeLast"])
+                            .spawn();
+                        window.remove_window();
+                    }),
+            );
+        }
+        footer = footer.child(
+            div()
+                .id("omarchy-gpui-notification-dismiss")
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(0x27272a))
+                .child("DISMISS")
+                .on_click(|_, window, _| {
+                    let executable = std::env::current_exe()
+                        .unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                    let _ = Command::new(executable)
+                        .args(["shell", "call", "notifications", "dismissOne"])
+                        .spawn();
+                    window.remove_window();
+                }),
+        );
+
+        div()
+            .id(format!("omarchy-gpui-notification-popup-{}", self.entry.id))
+            .size_full()
+            .p_3()
+            .rounded_lg()
+            .bg(rgba(0x18181bf5))
+            .border_1()
+            .border_color(rgb(0x52525b))
+            .text_color(rgb(0xf4f4f5))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(rgb(0x3f3f46))
+                            .child(badge),
+                    )
+                    .child(div().flex_1().text_size(px(14.0)).child(heading)),
+            )
+            .when(!self.entry.body.is_empty(), |popup| {
+                popup.child(
+                    div()
+                        .mt_2()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xd4d4d8))
+                        .child(self.entry.body.clone()),
+                )
+            })
+            .when(!self.entry.image.is_empty(), |popup| {
+                popup.child(
+                    div()
+                        .mt_1()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0xa1a1aa))
+                        .child("Image attachment"),
+                )
+            })
+            .child(footer)
+    }
+}
+
 pub struct BackgroundView {
     path: PathBuf,
 }
@@ -653,9 +842,16 @@ struct PanelView {
 
 #[derive(Clone, Debug, Default)]
 struct NotificationEntry {
+    id: u32,
     app: String,
+    app_icon: String,
     summary: String,
     body: String,
+    image: String,
+    glyph: String,
+    exec_argv: String,
+    urgency: u8,
+    expire_timeout: u32,
 }
 
 impl PanelView {
@@ -2236,8 +2432,18 @@ fn parse_notification_history(payload: &str) -> Vec<NotificationEntry> {
         .flatten()
         .filter_map(|entry| {
             Some(NotificationEntry {
+                id: entry
+                    .get("id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|id| u32::try_from(id).ok())
+                    .unwrap_or_default(),
                 app: entry
                     .get("app")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                app_icon: entry
+                    .get("appIcon")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
@@ -2251,9 +2457,48 @@ fn parse_notification_history(payload: &str) -> Vec<NotificationEntry> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                image: entry
+                    .get("image")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                glyph: entry
+                    .get("glyph")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                exec_argv: entry
+                    .get("execArgv")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                urgency: entry
+                    .get("urgency")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(1),
+                expire_timeout: entry
+                    .get("expireTimeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_default(),
             })
         })
         .collect()
+}
+
+fn notification_lifetime(entry: &NotificationEntry) -> Option<Duration> {
+    if entry.urgency >= 2 && entry.expire_timeout == 0 {
+        return None;
+    }
+    let milliseconds = if entry.expire_timeout > 0 {
+        u64::from(entry.expire_timeout)
+    } else if entry.urgency == 0 {
+        8_000
+    } else {
+        5_000
+    };
+    Some(Duration::from_millis(milliseconds.clamp(1_000, 20_000)))
 }
 
 fn wifi_qr_payload(snapshot: &ShellSnapshot) -> (String, Vec<String>) {
