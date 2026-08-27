@@ -259,6 +259,30 @@ impl ShellView {
             let label = label_for_entry(entry, clock, system, plugins);
             let _settings_are_preserved = &entry.settings;
             let id = entry.id.clone();
+            if id == "omarchy.media" {
+                let click_id = id.clone();
+                group = group.child(
+                    Self::chip(&label, &entry.id)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, event, window, cx| {
+                            view.handle_bar_click(&click_id, event, window, cx);
+                        }))
+                        .on_scroll_wheel(cx.listener(
+                            |_view, event: &ScrollWheelEvent, _window, _cx| {
+                                let delta = match event.delta {
+                                    ScrollDelta::Pixels(value) => f32::from(value.y),
+                                    ScrollDelta::Lines(value) => value.y,
+                                };
+                                if delta > 0.0 {
+                                    let _ = run_action(&SystemAction::MediaPrevious);
+                                } else if delta < 0.0 {
+                                    let _ = run_action(&SystemAction::MediaNext);
+                                }
+                            },
+                        )),
+                );
+                continue;
+            }
             if id == "omarchy.spacer" {
                 let span = entry
                     .settings
@@ -361,9 +385,70 @@ impl ShellView {
                     .arg("omarchy-update")
                     .spawn();
             }
+            "omarchy.clock" => {
+                if event.is_right_click() {
+                    let executable = std::env::current_exe()
+                        .unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                    let _ = Command::new(executable)
+                        .args(["shell", "call", "clock", "cycleFormat"])
+                        .spawn();
+                } else if event.is_middle_click() {
+                    self.spawn_omarchy_command("omarchy-menu-timezone", &[]);
+                } else {
+                    self.toggle_panel(id, cx);
+                }
+            }
+            "omarchy.weather" => {
+                if event.is_right_click() {
+                    let status = self
+                        .omarchy_command("omarchy-weather-status", &[])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                        .filter(|status| !status.is_empty());
+                    if let Some(status) = status {
+                        self.spawn_omarchy_command("omarchy-notification-send", &[&status]);
+                    }
+                } else if event.is_middle_click() {
+                    let executable = std::env::current_exe()
+                        .unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                    let _ = Command::new(executable)
+                        .args(["shell", "call", "weather", "refresh"])
+                        .spawn();
+                } else {
+                    self.toggle_panel(id, cx);
+                }
+            }
+            "omarchy.media" => {
+                if event.is_right_click() {
+                    self.toggle_panel(id, cx);
+                } else if event.is_middle_click() {
+                    let _ = run_action(&SystemAction::MediaNext);
+                } else {
+                    let _ = run_action(&SystemAction::MediaPlayPause);
+                }
+                cx.notify();
+            }
             _ if is_panel_capable(id) => self.toggle_panel(id, cx),
             _ => {}
         }
+    }
+
+    fn omarchy_command(&self, command: &str, args: &[&str]) -> Command {
+        let bundled = self.snapshot.omarchy_path.join("bin").join(command);
+        let program = if bundled.is_file() {
+            bundled
+        } else {
+            PathBuf::from(command)
+        };
+        let mut process = Command::new(program);
+        process.args(args);
+        process
+    }
+
+    fn spawn_omarchy_command(&self, command: &str, args: &[&str]) {
+        let _ = self.omarchy_command(command, args).spawn();
     }
 
     fn handle_tray_click(&mut self, item: &TrayItem, event: &ClickEvent, cx: &mut Context<Self>) {
@@ -1127,6 +1212,11 @@ impl PanelView {
                     .child(self.ipc_button("Source previous", &["media", "sourcePrevious"], cx))
                     .child(self.ipc_button("Source next", &["media", "sourceNext"], cx));
             }
+            "omarchy.clock" => {
+                actions = actions
+                    .child(self.ipc_button("Cycle format", &["clock", "cycleFormat"], cx))
+                    .child(self.ipc_button("Toggle week start", &["clock", "toggleWeekStart"], cx));
+            }
             "omarchy.network" => {
                 if !self.system.network.connection.is_empty()
                     && self.system.network.connection != "--"
@@ -1237,6 +1327,11 @@ impl PanelView {
                         cx,
                     ));
                 }
+                actions = actions.child(self.ipc_button(
+                    "Toggle percentage",
+                    &["power", "togglePercentage"],
+                    cx,
+                ));
             }
             "omarchy.agents" => {
                 actions = actions
@@ -1327,7 +1422,8 @@ impl PanelView {
                         "omarchy-weather-location",
                         &["--clear"],
                         cx,
-                    ));
+                    ))
+                    .child(self.ipc_button("Edit location", &["weather", "edit"], cx));
             }
             _ => {}
         }
@@ -3123,7 +3219,12 @@ fn label_for(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{menu_label, menu_matches_filter, parse_notification_history, parse_osd_payload};
+    use std::time::Duration;
+
+    use super::{
+        NotificationEntry, menu_label, menu_matches_filter, notification_lifetime,
+        parse_notification_history, parse_osd_payload,
+    };
     use crate::menu::{MenuItem, MenuItemKind};
 
     #[test]
@@ -3161,6 +3262,25 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].app, "mail");
         assert!(parse_notification_history("not-json").is_empty());
+    }
+
+    #[test]
+    fn notification_lifetime_preserves_critical_and_bounds_requested_timeouts() {
+        let critical = NotificationEntry {
+            urgency: 2,
+            ..NotificationEntry::default()
+        };
+        assert!(notification_lifetime(&critical).is_none());
+        let short = NotificationEntry {
+            expire_timeout: 100,
+            ..NotificationEntry::default()
+        };
+        assert_eq!(notification_lifetime(&short), Some(Duration::from_secs(1)));
+        let long = NotificationEntry {
+            expire_timeout: 60_000,
+            ..NotificationEntry::default()
+        };
+        assert_eq!(notification_lifetime(&long), Some(Duration::from_secs(20)));
     }
 }
 
