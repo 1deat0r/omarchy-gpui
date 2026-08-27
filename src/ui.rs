@@ -929,6 +929,9 @@ struct PanelView {
     notification_entries: Vec<NotificationEntry>,
     reminder_minutes: String,
     reminder_step_message: bool,
+    calendar_year: i32,
+    calendar_month: u8,
+    calendar_today: (i32, u8, u8),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -966,6 +969,7 @@ impl PanelView {
         };
         let (osd_icon, osd_message) = parse_osd_payload(payload);
         let notification_entries = parse_notification_history(payload);
+        let calendar_today = local_date_parts();
         let refresh_id = id.clone();
         let refresh_snapshot = snapshot.clone();
         let refresh_plugin_path = snapshot.omarchy_path.clone();
@@ -1070,6 +1074,9 @@ impl PanelView {
             notification_entries,
             reminder_minutes: String::new(),
             reminder_step_message: false,
+            calendar_year: calendar_today.0,
+            calendar_month: calendar_today.1,
+            calendar_today,
         }
     }
 
@@ -2082,6 +2089,10 @@ impl PanelView {
             self.handle_dmenu_key(event, window, cx);
             return;
         }
+        if self.id == "omarchy.clock" {
+            self.handle_clock_key(event, window, cx);
+            return;
+        }
         let Some(model) = self.menu.clone() else {
             if self.is_overlay() {
                 self.handle_overlay_key(event, window, cx);
@@ -2382,9 +2393,138 @@ impl PanelView {
             )
     }
 
-    fn rich_panel_content(&self) -> Option<Div> {
+    fn handle_clock_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => window.remove_window(),
+            "left" | "h" => self.step_calendar(-1, 0, cx),
+            "right" | "l" => self.step_calendar(1, 0, cx),
+            "up" | "k" => self.step_calendar(0, -1, cx),
+            "down" | "j" => self.step_calendar(0, 1, cx),
+            "home" => {
+                self.calendar_year = self.calendar_today.0;
+                self.calendar_month = self.calendar_today.1;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn step_calendar(&mut self, month_delta: i32, year_delta: i32, cx: &mut Context<Self>) {
+        let total = self.calendar_year.saturating_mul(12)
+            + i32::from(self.calendar_month.saturating_sub(1))
+            + month_delta
+            + year_delta.saturating_mul(12);
+        self.calendar_year = total.div_euclid(12);
+        self.calendar_month = u8::try_from(total.rem_euclid(12) + 1).unwrap_or(1);
+        cx.notify();
+    }
+
+    fn clock_calendar_content(&mut self, cx: &mut Context<Self>) -> Div {
+        let mut content = div().flex().flex_col().gap_3().mt_3();
+        let title = format!(
+            "{} {}",
+            calendar_month_name(self.calendar_month),
+            self.calendar_year
+        );
+        content = content.child(panel_hero("Clock", title)).child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(self.calendar_button("‹", -1, 0, cx))
+                .child(
+                    div()
+                        .id("omarchy-gpui-calendar-today")
+                        .cursor_pointer()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x27272a))
+                        .child("TODAY")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.calendar_year = view.calendar_today.0;
+                            view.calendar_month = view.calendar_today.1;
+                            cx.notify();
+                        })),
+                )
+                .child(self.calendar_button("›", 1, 0, cx)),
+        );
+
+        let mut weekdays = div().flex().gap_1();
+        for weekday in ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] {
+            weekdays = weekdays.child(
+                div()
+                    .w(px(98.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(0xa1a1aa))
+                    .child(weekday),
+            );
+        }
+        content = content.child(weekdays);
+
+        let leading =
+            calendar_weekday(self.calendar_year, self.calendar_month).saturating_sub(1) as usize;
+        let days = calendar_days_in_month(self.calendar_year, self.calendar_month);
+        let mut grid = div().flex().flex_wrap().gap_1();
+        for index in 0..42 {
+            let day = if index >= leading && index < leading + days as usize {
+                Some((index - leading + 1) as u8)
+            } else {
+                None
+            };
+            let today = day.is_some_and(|day| {
+                (self.calendar_year, self.calendar_month, day) == self.calendar_today
+            });
+            grid = grid.child(
+                div()
+                    .w(px(98.0))
+                    .h(px(34.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(if today { rgb(0x7c3aed) } else { rgb(0x27272a) })
+                    .text_color(if day.is_some() {
+                        rgb(0xf4f4f5)
+                    } else {
+                        rgb(0x52525b)
+                    })
+                    .child(day.map_or_else(String::new, |day| day.to_string())),
+            );
+        }
+        content.child(grid)
+    }
+
+    fn calendar_button(
+        &self,
+        label: &str,
+        month_delta: i32,
+        year_delta: i32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let direction = if month_delta < 0 { "previous" } else { "next" };
+        div()
+            .id(format!("omarchy-gpui-calendar-{direction}"))
+            .cursor_pointer()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x27272a))
+            .child(label.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.step_calendar(month_delta, year_delta, cx);
+            }))
+    }
+
+    fn rich_panel_content(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let mut content = div().flex().flex_col().gap_3().mt_3();
         match self.id.as_str() {
+            "omarchy.clock" => Some(self.clock_calendar_content(cx)),
             "omarchy.audio" => {
                 content = content.child(panel_hero(
                     "Audio",
@@ -2694,7 +2834,7 @@ impl Render for PanelView {
             self.osd_content()
         } else if self.is_overlay() {
             self.overlay_content(cx)
-        } else if let Some(content) = self.rich_panel_content() {
+        } else if let Some(content) = self.rich_panel_content(cx) {
             content
         } else {
             let mut rows = div().flex().flex_col().gap_2().mt_3();
@@ -3830,6 +3970,65 @@ fn local_clock() -> String {
 
     let minutes = (seconds / 60) % (24 * 60);
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn local_date_parts() -> (i32, u8, u8) {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+
+    #[cfg(unix)]
+    {
+        let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+        if !result.is_null() {
+            let local = unsafe { local.assume_init() };
+            return (
+                local.tm_year + 1900,
+                u8::try_from(local.tm_mon + 1).unwrap_or(1),
+                u8::try_from(local.tm_mday).unwrap_or(1),
+            );
+        }
+    }
+
+    (1970, 1, 1)
+}
+
+fn calendar_month_name(month: u8) -> &'static str {
+    [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+    .get(month.saturating_sub(1) as usize)
+    .copied()
+    .unwrap_or("January")
+}
+
+fn calendar_days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 31,
+    }
+}
+
+fn calendar_weekday(year: i32, month: u8) -> u8 {
+    match weekday_sunday(year, i32::from(month), 1) {
+        0 => 7,
+        weekday => u8::try_from(weekday).unwrap_or(1),
+    }
 }
 
 fn clock_label(settings: &serde_json::Value, fallback: &str, vertical: bool) -> String {
