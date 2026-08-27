@@ -826,6 +826,36 @@ impl Render for NotificationPopupView {
                     }),
             );
         }
+        for (index, action) in self.entry.actions.iter().enumerate() {
+            let action_key = action.identifier.clone();
+            let action_label = action.label.clone();
+            let notification_id = self.entry.id.to_string();
+            footer = footer.child(
+                div()
+                    .id(format!("omarchy-gpui-notification-action-{index}"))
+                    .cursor_pointer()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x3f3f46))
+                    .child(action_label)
+                    .on_click(move |_, window, _| {
+                        let executable = std::env::current_exe()
+                            .unwrap_or_else(|_| PathBuf::from("omarchy-gpui-shell"));
+                        let _ = Command::new(executable)
+                            .args([
+                                "shell",
+                                "call",
+                                "notifications",
+                                "invokeAction",
+                                notification_id.as_str(),
+                                action_key.as_str(),
+                            ])
+                            .spawn();
+                        window.remove_window();
+                    }),
+            );
+        }
         footer = footer.child(
             div()
                 .id("omarchy-gpui-notification-dismiss")
@@ -970,6 +1000,13 @@ struct NotificationEntry {
     exec_argv: String,
     urgency: u8,
     expire_timeout: u32,
+    actions: Vec<NotificationAction>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NotificationAction {
+    identifier: String,
+    label: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -3410,6 +3447,26 @@ fn parse_notification_history(payload: &str) -> Vec<NotificationEntry> {
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok())
                     .unwrap_or_default(),
+                actions: entry
+                    .get("actions")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|action| {
+                        Some(NotificationAction {
+                            identifier: action
+                                .get("identifier")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)?,
+                            label: action
+                                .get("label")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)?,
+                        })
+                    })
+                    .collect(),
             })
         })
         .collect()
@@ -4343,10 +4400,12 @@ mod tests {
             parse_osd_payload(r#"{"icon":"volume","message":"50%"}"#),
             ("volume".to_string(), "50%".to_string())
         );
-        let notifications =
-            parse_notification_history(r#"[{"app":"mail","summary":"New mail","body":"Hello"}]"#);
+        let notifications = parse_notification_history(
+            r#"[{"app":"mail","summary":"New mail","body":"Hello","actions":[{"identifier":"default","label":"Open"}]}]"#,
+        );
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].app, "mail");
+        assert_eq!(notifications[0].actions[0].label, "Open");
         assert!(parse_notification_history("not-json").is_empty());
     }
 

@@ -180,6 +180,27 @@ impl NotificationService {
         Ok(())
     }
 
+    async fn invoke_action(
+        &self,
+        id: u32,
+        action_key: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let valid = self
+            .state
+            .lock()
+            .map_err(|_| failed("notification state lock poisoned"))?
+            .actions
+            .get(&id)
+            .is_some_and(|actions| actions.iter().any(|key| key == &action_key));
+        if !valid {
+            return Err(failed("notification action is unavailable"));
+        }
+        Self::action_invoked(&emitter, id, action_key)
+            .await
+            .map_err(|error| failed(format!("emit ActionInvoked: {error}")))
+    }
+
     #[zbus(signal)]
     async fn notification_closed(
         emitter: &SignalEmitter<'_>,
@@ -199,6 +220,7 @@ struct NotificationState {
     home: PathBuf,
     next_id: u32,
     live: BTreeMap<u32, PathBuf>,
+    actions: BTreeMap<u32, Vec<String>>,
     events: Sender<IpcEvent>,
 }
 
@@ -215,6 +237,7 @@ impl NotificationState {
             home,
             next_id: highest_id.saturating_add(1).max(1),
             live,
+            actions: BTreeMap::new(),
             events,
         }
     }
@@ -227,16 +250,24 @@ impl NotificationState {
         app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>,
+        actions: Vec<String>,
         hints: &std::collections::HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> Result<AcceptedNotification, String> {
-        let id = if replaces_id != 0 && self.live.contains_key(&replaces_id) {
+        let replacing_path = (replaces_id != 0)
+            .then(|| self.live.get(&replaces_id).cloned())
+            .flatten();
+        let id = if replacing_path.is_some() {
             replaces_id
         } else {
             self.allocate_id()
         };
-        if let Some(old_path) = self.live.remove(&id) {
+        let replacement_timestamp = replacing_path
+            .as_deref()
+            .and_then(read_notification_timestamp);
+        if let Some(old_path) = self.live.remove(&id)
+            && replacing_path.as_deref() != Some(old_path.as_path())
+        {
             remove_file_if_present(&old_path)?;
         }
 
@@ -252,9 +283,10 @@ impl NotificationState {
             exec_argv: string_hint(hints, &["omarchy-exec-argv"]),
             urgency: hint_u8(hints, "urgency").unwrap_or(NORMAL_URGENCY),
             expire_timeout: normalize_expire_timeout(expire_timeout),
-            timestamp: unix_millis(),
+            timestamp: replacement_timestamp.unwrap_or_else(unix_millis),
+            actions: parse_actions(&actions),
         };
-        let path = live_path(&self.home, &entry);
+        let path = replacing_path.unwrap_or_else(|| live_path(&self.home, &entry));
         write_entry(&path, &entry)?;
 
         let dnd = load_dnd(&self.home);
@@ -270,6 +302,14 @@ impl NotificationState {
             }
         } else {
             self.live.insert(id, path);
+            self.actions.insert(
+                id,
+                entry
+                    .actions
+                    .iter()
+                    .map(|action| action.identifier.clone())
+                    .collect(),
+            );
             Some(entry)
         };
 
@@ -287,6 +327,7 @@ impl NotificationState {
         let Some(path) = self.live.remove(&id) else {
             return Ok(false);
         };
+        self.actions.remove(&id);
         move_to_history(&self.home, &path)?;
         Ok(true)
     }
@@ -295,6 +336,7 @@ impl NotificationState {
         if self.live.get(&id).is_some_and(|path| path == expected_path)
             && let Some(path) = self.live.remove(&id)
         {
+            self.actions.remove(&id);
             move_to_history(&self.home, &path)?;
         }
         Ok(())
@@ -325,6 +367,33 @@ struct NotificationEntry {
     #[serde(rename = "expireTimeout")]
     expire_timeout: u32,
     timestamp: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    actions: Vec<NotificationAction>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct NotificationAction {
+    identifier: String,
+    label: String,
+}
+
+fn parse_actions(values: &[String]) -> Vec<NotificationAction> {
+    values
+        .chunks_exact(2)
+        .filter_map(|pair| {
+            let identifier = pair[0].clone();
+            let label = pair[1].clone();
+            (!identifier.is_empty() && !label.is_empty())
+                .then_some(NotificationAction { identifier, label })
+        })
+        .collect()
+}
+
+fn read_notification_timestamp(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("timestamp").and_then(serde_json::Value::as_u64))
 }
 
 fn scan_live_notifications(home: &Path) -> (BTreeMap<u32, PathBuf>, u32) {
@@ -518,7 +587,7 @@ fn failed(message: impl Into<String>) -> zbus::fdo::Error {
 mod tests {
     use super::{
         CRITICAL_URGENCY, NORMAL_URGENCY, NotificationEntry, is_ephemeral,
-        normalize_expire_timeout, notification_file_name, should_bypass_dnd,
+        normalize_expire_timeout, notification_file_name, parse_actions, should_bypass_dnd,
     };
 
     #[test]
@@ -558,7 +627,22 @@ mod tests {
             urgency: NORMAL_URGENCY,
             expire_timeout: 0,
             timestamp: 123,
+            actions: Vec::new(),
         };
         assert_eq!(notification_file_name(&entry), "123-7.json");
+    }
+
+    #[test]
+    fn notification_actions_preserve_identifier_label_pairs() {
+        let actions = parse_actions(&[
+            "default".to_string(),
+            "Open".to_string(),
+            "snooze".to_string(),
+            "Snooze".to_string(),
+            "dangling".to_string(),
+        ]);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].identifier, "default");
+        assert_eq!(actions[1].label, "Snooze");
     }
 }

@@ -855,6 +855,14 @@ fn dispatch_call(
             };
             Ok(outcome(output, None))
         }
+        ("omarchy.notifications", "invokeAction") => {
+            let id = required_call_arg(args, 0, "notification id")?
+                .parse::<u32>()
+                .map_err(|_| "notification id must be an integer".to_string())?;
+            let action_key = required_call_arg(args, 1, "notification action")?;
+            invoke_notification_action(id, action_key)?;
+            Ok(outcome("ok", None))
+        }
         ("omarchy.notifications", "dismiss") => {
             let summary = required_call_arg(args, 0, "notification summary")?;
             let removed = dismiss_notifications_matching(
@@ -1331,6 +1339,7 @@ fn call_method_supported(id: &str, method: &str) -> bool {
                 | "dismissAll"
                 | "dismissOne"
                 | "invokeLast"
+                | "invokeAction"
                 | "dismiss"
                 | "ping"
         ),
@@ -1765,6 +1774,24 @@ fn invoke_latest_live_notification(home: &Path) -> Result<bool, String> {
     fs::remove_file(&path).map_err(|error| format!("remove invoked notification: {error}"))?;
     remove_notification_images(&directory.join("images"), stem)?;
     Ok(true)
+}
+
+fn invoke_notification_action(id: u32, action_key: &str) -> Result<(), String> {
+    if id == 0 || action_key.is_empty() || action_key.chars().any(char::is_control) {
+        return Err("invalid notification action".to_string());
+    }
+    let connection = zbus::blocking::Connection::session()
+        .map_err(|error| format!("connect session bus: {error}"))?;
+    let proxy = zbus::blocking::Proxy::new(
+        &connection,
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+    )
+    .map_err(|error| format!("create notification proxy: {error}"))?;
+    proxy
+        .call::<_, _, ()>("InvokeAction", &(id, action_key.to_string()))
+        .map_err(|error| format!("invoke notification action: {error}"))
 }
 
 fn dismiss_notifications_matching(home: &Path, needle: &str) -> Result<bool, String> {
