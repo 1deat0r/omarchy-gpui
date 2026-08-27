@@ -646,7 +646,28 @@ impl ShellView {
 
     fn apply_ipc_event(&mut self, event: IpcEvent, cx: &mut Context<Self>) {
         match event {
-            IpcEvent::Refresh => {}
+            IpcEvent::Refresh => {
+                let plugin_path = self.snapshot.omarchy_path.clone();
+                cx.spawn(async move |this, cx| {
+                    let (snapshot, system, plugins) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let snapshot = ShellSnapshot::load();
+                            let system = SystemSnapshot::collect();
+                            let plugins = PluginSnapshot::collect(&plugin_path);
+                            (snapshot, system, plugins)
+                        })
+                        .await;
+                    let _ = this.update(cx, |view, cx| {
+                        view.snapshot = snapshot;
+                        view.system = system;
+                        view.plugins = plugins;
+                        view.clock = local_clock();
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
             IpcEvent::Background { path, .. } => {
                 if let Some(handle) = self.background_window.as_ref() {
                     let _ = handle.update(cx, |view, _, cx| {
