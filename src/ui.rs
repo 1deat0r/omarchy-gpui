@@ -951,6 +951,8 @@ struct PanelView {
     reminder_minutes: String,
     reminder_step_message: bool,
     weather_editing: bool,
+    weather_suggestions: Vec<WeatherSuggestion>,
+    weather_selected_suggestion: usize,
     calendar_year: i32,
     calendar_month: u8,
     calendar_today: (i32, u8, u8),
@@ -968,6 +970,14 @@ struct NotificationEntry {
     exec_argv: String,
     urgency: u8,
     expire_timeout: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct WeatherSuggestion {
+    name: String,
+    description: String,
+    latitude: f64,
+    longitude: f64,
 }
 
 impl PanelView {
@@ -1102,6 +1112,8 @@ impl PanelView {
             reminder_minutes: String::new(),
             reminder_step_message: false,
             weather_editing,
+            weather_suggestions: Vec::new(),
+            weather_selected_suggestion: 0,
             calendar_year: calendar_today.0,
             calendar_month: calendar_today.1,
             calendar_today,
@@ -2428,7 +2440,48 @@ impl PanelView {
     fn start_weather_editing(&mut self, cx: &mut Context<Self>) {
         self.weather_editing = true;
         self.filter_text = self.plugins.weather.location.clone();
+        self.weather_suggestions.clear();
+        self.weather_selected_suggestion = 0;
         cx.notify();
+    }
+
+    fn request_weather_geocode(&mut self, cx: &mut Context<Self>) {
+        let query = self.filter_text.trim().to_string();
+        self.weather_suggestions.clear();
+        self.weather_selected_suggestion = 0;
+        if query.chars().count() < 2 {
+            cx.notify();
+            return;
+        }
+        let encoded = percent_encode_text(&query);
+        cx.spawn(async move |this, cx| {
+            let suggestions = cx
+                .background_executor()
+                .spawn(async move {
+                    let url = format!(
+                        "https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5&language=en&format=json"
+                    );
+                    let output = Command::new("curl")
+                        .args(["-fsS", "--max-time", "5", &url])
+                        .output()
+                        .ok();
+                    output
+                        .filter(|output| output.status.success())
+                        .map(|output| {
+                            parse_weather_geocode(&String::from_utf8_lossy(&output.stdout))
+                        })
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.weather_editing && view.filter_text.trim() == query {
+                    view.weather_suggestions = suggestions;
+                    view.weather_selected_suggestion = 0;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn handle_weather_key(
@@ -2451,10 +2504,23 @@ impl PanelView {
             "escape" => {
                 self.weather_editing = false;
                 self.filter_text.clear();
+                self.weather_suggestions.clear();
+                self.weather_selected_suggestion = 0;
                 cx.notify();
             }
             "backspace" => {
                 self.filter_text.pop();
+                self.request_weather_geocode(cx);
+                cx.notify();
+            }
+            "up" | "k" if !self.weather_suggestions.is_empty() => {
+                self.weather_selected_suggestion =
+                    self.weather_selected_suggestion.saturating_sub(1);
+                cx.notify();
+            }
+            "down" | "j" if !self.weather_suggestions.is_empty() => {
+                self.weather_selected_suggestion = (self.weather_selected_suggestion + 1)
+                    .min(self.weather_suggestions.len().saturating_sub(1));
                 cx.notify();
             }
             "enter" | "return" => self.commit_weather_location(cx),
@@ -2470,6 +2536,7 @@ impl PanelView {
                     && !character.chars().any(char::is_control)
                 {
                     self.filter_text.push_str(character);
+                    self.request_weather_geocode(cx);
                     cx.notify();
                 }
             }
@@ -2481,6 +2548,15 @@ impl PanelView {
         let program = self.omarchy_program("omarchy-weather-location");
         let result = if location.is_empty() {
             Command::new(&program).arg("--clear").spawn()
+        } else if let Some(suggestion) = self
+            .weather_suggestions
+            .get(self.weather_selected_suggestion)
+            .filter(|suggestion| suggestion.name.eq_ignore_ascii_case(&location))
+        {
+            let coordinates = format!("{},{}", suggestion.latitude, suggestion.longitude);
+            Command::new(&program)
+                .args(["--set", suggestion.name.as_str(), coordinates.as_str()])
+                .spawn()
         } else {
             Command::new(&program)
                 .args(["--set", location.as_str()])
@@ -2492,6 +2568,8 @@ impl PanelView {
         };
         self.weather_editing = false;
         self.filter_text.clear();
+        self.weather_suggestions.clear();
+        self.weather_selected_suggestion = 0;
         cx.notify();
     }
 
@@ -2676,6 +2754,47 @@ impl PanelView {
                                 self.filter_text.clone()
                             }),
                     );
+                    if !self.weather_suggestions.is_empty() {
+                        content = content.child(
+                            div()
+                                .id("omarchy-gpui-weather-suggestions")
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(self.weather_suggestions.iter().enumerate().map(
+                                    |(index, suggestion)| {
+                                        let name = suggestion.name.clone();
+                                        let description = suggestion.description.clone();
+                                        div()
+                                            .id(format!("omarchy-gpui-weather-suggestion-{index}"))
+                                            .cursor_pointer()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(if index == self.weather_selected_suggestion {
+                                                rgb(0x3f3f46)
+                                            } else {
+                                                rgb(0x27272a)
+                                            })
+                                            .child(name.clone())
+                                            .when(!description.is_empty(), |row| {
+                                                row.child(
+                                                    div()
+                                                        .mt_1()
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(0xa1a1aa))
+                                                        .child(description.clone()),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.filter_text = name.clone();
+                                                view.weather_selected_suggestion = index;
+                                                view.commit_weather_location(cx);
+                                            }))
+                                    },
+                                )),
+                        );
+                    }
                 } else {
                     let location = if weather.location.is_empty() {
                         "Auto-detected location".to_string()
@@ -3801,6 +3920,56 @@ fn weather_day_card(day: &WeatherDay) -> Div {
         )
 }
 
+fn parse_weather_geocode(raw: &str) -> Vec<WeatherSuggestion> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let name = result
+                .get("name")
+                .and_then(serde_json::Value::as_str)?
+                .trim()
+                .to_string();
+            let latitude = result.get("latitude")?.as_f64()?;
+            let longitude = result.get("longitude")?.as_f64()?;
+            let description = ["admin1", "country"]
+                .into_iter()
+                .filter_map(|key| {
+                    result
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(WeatherSuggestion {
+                name,
+                description,
+                latitude,
+                longitude,
+            })
+        })
+        .take(5)
+        .collect()
+}
+
+fn percent_encode_text(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 fn forecast_day_label(date: &str) -> String {
     let mut parts = date.split('-');
     let year = parts.next().and_then(|value| value.parse::<i32>().ok());
@@ -4140,6 +4309,7 @@ mod tests {
     use super::{
         NotificationEntry, format_clock_pattern, menu_label, menu_matches_filter,
         notification_lifetime, parse_notification_history, parse_osd_payload,
+        parse_weather_geocode,
     };
     use crate::menu::{MenuItem, MenuItemKind};
 
@@ -4178,6 +4348,17 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].app, "mail");
         assert!(parse_notification_history("not-json").is_empty());
+    }
+
+    #[test]
+    fn parses_weather_geocode_suggestions_with_location_metadata() {
+        let suggestions = parse_weather_geocode(
+            r#"{"results":[{"name":"Auckland","admin1":"Auckland","country":"New Zealand","latitude":-36.85,"longitude":174.76}]}"#,
+        );
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].name, "Auckland");
+        assert_eq!(suggestions[0].description, "Auckland, New Zealand");
+        assert!(parse_weather_geocode("not-json").is_empty());
     }
 
     #[test]
