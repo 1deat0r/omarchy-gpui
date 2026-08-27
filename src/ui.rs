@@ -988,6 +988,12 @@ struct PanelView {
     network_selected_index: usize,
     speed_test: SpeedTestState,
     disk_speed_test: DiskSpeedTestState,
+    gallery_selected_index: usize,
+    gallery_choice: String,
+    gallery_toggle: bool,
+    gallery_switch: bool,
+    gallery_slider: u8,
+    gallery_number: i32,
     calendar_year: i32,
     calendar_month: u8,
     calendar_today: (i32, u8, u8),
@@ -1198,6 +1204,12 @@ impl PanelView {
             network_selected_index: 0,
             speed_test: SpeedTestState::default(),
             disk_speed_test: DiskSpeedTestState::default(),
+            gallery_selected_index: 0,
+            gallery_choice: "top".to_string(),
+            gallery_toggle: true,
+            gallery_switch: true,
+            gallery_slider: 50,
+            gallery_number: 15,
             calendar_year: calendar_today.0,
             calendar_month: calendar_today.1,
             calendar_today,
@@ -2611,6 +2623,58 @@ impl PanelView {
         }
     }
 
+    fn handle_gallery_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        const CONTROL_COUNT: usize = 7;
+        match key {
+            "escape" => window.remove_window(),
+            "up" | "k" => {
+                self.gallery_selected_index = self.gallery_selected_index.saturating_sub(1);
+                cx.notify();
+            }
+            "down" | "j" => {
+                self.gallery_selected_index =
+                    (self.gallery_selected_index + 1).min(CONTROL_COUNT - 1);
+                cx.notify();
+            }
+            "left" | "h" => {
+                match self.gallery_selected_index {
+                    1 => self.gallery_choice = gallery_choice(-1, &self.gallery_choice),
+                    3 => self.gallery_slider = self.gallery_slider.saturating_sub(5),
+                    6 => self.gallery_number = (self.gallery_number - 1).max(0),
+                    _ => {}
+                }
+                cx.notify();
+            }
+            "right" | "l" => {
+                match self.gallery_selected_index {
+                    1 => self.gallery_choice = gallery_choice(1, &self.gallery_choice),
+                    3 => self.gallery_slider = self.gallery_slider.saturating_add(5).min(100),
+                    6 => self.gallery_number = (self.gallery_number + 1).min(100),
+                    _ => {}
+                }
+                cx.notify();
+            }
+            "enter" | "return" => {
+                match self.gallery_selected_index {
+                    0 => self.message = "Button activated".to_string(),
+                    1 => self.gallery_choice = gallery_choice(1, &self.gallery_choice),
+                    2 => self.gallery_toggle = !self.gallery_toggle,
+                    4 => self.gallery_switch = !self.gallery_switch,
+                    5 => self.message = "Text field focused".to_string(),
+                    _ => {}
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.dmenu.is_some() {
             self.handle_dmenu_key(event, window, cx);
@@ -2622,6 +2686,10 @@ impl PanelView {
         }
         if self.id == "omarchy.network" {
             self.handle_network_key(event, window, cx);
+            return;
+        }
+        if self.id == "omarchy.dev-gallery" {
+            self.handle_gallery_key(event, window, cx);
             return;
         }
         if self.id == "omarchy.clock" {
@@ -2926,6 +2994,251 @@ impl PanelView {
                         self.osd_message.clone()
                     }),
             )
+    }
+
+    fn gallery_control_row(
+        &self,
+        index: usize,
+        label: &str,
+        detail: &str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.gallery_selected_index == index;
+        div()
+            .id(format!("omarchy-gpui-gallery-control-{index}"))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(rgb(0xf4f4f5)).child(label.to_string()))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xa1a1aa))
+                            .child(detail.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .text_color(if selected {
+                        rgb(0xc4b5fd)
+                    } else {
+                        rgb(0x71717a)
+                    })
+                    .child(if selected { "●" } else { "○" }),
+            )
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.gallery_selected_index = index;
+                cx.notify();
+            }))
+    }
+
+    fn gallery_toggle_row(
+        &self,
+        index: usize,
+        label: &str,
+        enabled: bool,
+        detail: &str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.gallery_selected_index == index;
+        div()
+            .id(format!("omarchy-gpui-gallery-toggle-{index}"))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(rgb(0xf4f4f5)).child(label.to_string()))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xa1a1aa))
+                            .child(detail.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(if enabled {
+                        rgb(0x7c3aed)
+                    } else {
+                        rgb(0x3f3f46)
+                    })
+                    .child(if enabled { "ON" } else { "OFF" }),
+            )
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.gallery_selected_index = index;
+                if index == 2 {
+                    view.gallery_toggle = !view.gallery_toggle;
+                } else if index == 4 {
+                    view.gallery_switch = !view.gallery_switch;
+                }
+                cx.notify();
+            }))
+    }
+
+    fn gallery_content(&mut self, cx: &mut Context<Self>) -> Div {
+        let mut content = div().flex().flex_col().gap_2().mt_3();
+        content = content
+            .child(panel_hero(
+                "Omarchy shell · dev gallery",
+                "Live GPUI component reference".to_string(),
+            ))
+            .child(panel_empty_row(
+                "Use j/k or ↑/↓ to walk controls, h/l or ←/→ to adjust values, Enter to activate, and Esc to close.",
+            ))
+            .child(panel_section_title("CURSOR SURFACE"))
+            .child(self.gallery_control_row(
+                0,
+                "CursorSurface",
+                "Keyboard and pointer selection share one highlight state.",
+                cx,
+            ))
+            .child(panel_section_title("BUTTON GROUP"));
+
+        let mut choices = div().flex().flex_wrap().gap_2();
+        for choice in ["top", "right", "bottom", "left"] {
+            let selected = self.gallery_choice == choice;
+            let choice_for_child = choice.to_string();
+            let choice_for_click = choice_for_child.clone();
+            choices = choices.child(
+                div()
+                    .id(format!("omarchy-gpui-gallery-choice-{choice}"))
+                    .cursor_pointer()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if selected {
+                        rgb(0x7c3aed)
+                    } else {
+                        rgb(0x27272a)
+                    })
+                    .border_1()
+                    .border_color(if self.gallery_selected_index == 1 {
+                        rgb(0xa78bfa)
+                    } else {
+                        rgb(0x3f3f46)
+                    })
+                    .child(choice_for_child)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.gallery_selected_index = 1;
+                        view.gallery_choice = choice_for_click.clone();
+                        cx.notify();
+                    })),
+            );
+        }
+        content = content.child(choices);
+
+        content = content
+            .child(panel_section_title("TOGGLE"))
+            .child(self.gallery_toggle_row(
+                2,
+                "Toggle",
+                self.gallery_toggle,
+                "A stateful boolean control.",
+                cx,
+            ))
+            .child(panel_section_title("SLIDER"))
+            .child(
+                div()
+                    .id("omarchy-gpui-gallery-slider")
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if self.gallery_selected_index == 3 {
+                        rgb(0x3f3f46)
+                    } else {
+                        rgb(0x27272a)
+                    })
+                    .border_1()
+                    .border_color(if self.gallery_selected_index == 3 {
+                        rgb(0xa78bfa)
+                    } else {
+                        rgb(0x3f3f46)
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child("Slider")
+                            .child(format!("{}%", self.gallery_slider)),
+                    )
+                    .child(panel_meter(Some(self.gallery_slider), false))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.gallery_selected_index = 3;
+                        cx.notify();
+                    })),
+            )
+            .child(panel_section_title("TOGGLE SWITCH"))
+            .child(self.gallery_toggle_row(
+                4,
+                "Switch",
+                self.gallery_switch,
+                "Switches use the same cursor and selected-state contract.",
+                cx,
+            ))
+            .child(panel_section_title("TEXT FIELD"))
+            .child(self.gallery_control_row(
+                5,
+                "Text field",
+                "Enter selects the field; typed characters append to the demo value.",
+                cx,
+            ))
+            .child(panel_section_title("NUMBER FIELD"))
+            .child(self.gallery_control_row(
+                6,
+                "Number field",
+                &format!("Value {} · h/l adjusts by one", self.gallery_number),
+                cx,
+            ));
+        content
     }
 
     fn start_weather_editing(&mut self, cx: &mut Context<Self>) {
@@ -4442,6 +4755,8 @@ impl Render for PanelView {
             self.notification_content()
         } else if self.id == "omarchy.osd" {
             self.osd_content()
+        } else if self.id == "omarchy.dev-gallery" {
+            self.gallery_content(cx)
         } else if self.is_overlay() {
             self.overlay_content(cx)
         } else if let Some(content) = self.rich_panel_content(cx) {
@@ -5236,6 +5551,16 @@ fn friendly_model_name(id: &str) -> String {
         .join(" ")
 }
 
+fn gallery_choice(delta: i32, current: &str) -> String {
+    const CHOICES: [&str; 4] = ["top", "right", "bottom", "left"];
+    let current_index = CHOICES
+        .iter()
+        .position(|choice| *choice == current)
+        .unwrap_or(0);
+    let next_index = (current_index as i32 + delta).rem_euclid(CHOICES.len() as i32) as usize;
+    CHOICES[next_index].to_string()
+}
+
 fn run_speed_test(program: &Path) -> Result<(u32, u32), String> {
     let download = run_timed_command(program, &["down"], 6)?;
     let upload = run_timed_command(program, &["up"], 6)?;
@@ -5735,10 +6060,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        NotificationEntry, format_bytes, format_clock_pattern, last_numeric_line, menu_label,
-        menu_matches_filter, network_security_is_enterprise, network_security_requires_credentials,
-        notification_lifetime, parse_notification_history, parse_osd_payload, parse_rate_value,
-        parse_weather_geocode,
+        NotificationEntry, format_bytes, format_clock_pattern, gallery_choice, last_numeric_line,
+        menu_label, menu_matches_filter, network_security_is_enterprise,
+        network_security_requires_credentials, notification_lifetime, parse_notification_history,
+        parse_osd_payload, parse_rate_value, parse_weather_geocode,
     };
     use crate::menu::{MenuItem, MenuItemKind};
 
@@ -5816,6 +6141,14 @@ mod tests {
         assert_eq!(last_numeric_line("disk Samsung\nread 2048\n"), None);
         assert_eq!(parse_rate_value("12.6"), Some(13));
         assert_eq!(parse_rate_value("not-a-rate"), None);
+    }
+
+    #[test]
+    fn gallery_choice_wraps_like_the_reference_button_group() {
+        assert_eq!(gallery_choice(1, "top"), "right");
+        assert_eq!(gallery_choice(-1, "top"), "left");
+        assert_eq!(gallery_choice(4, "bottom"), "bottom");
+        assert_eq!(gallery_choice(1, "unknown"), "right");
     }
 
     #[test]
