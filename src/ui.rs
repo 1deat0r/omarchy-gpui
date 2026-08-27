@@ -1158,6 +1158,84 @@ impl PanelView {
                     .child(self.action_button("Mute output", SystemAction::ToggleOutputMute, cx))
                     .child(self.action_button("Mute input", SystemAction::ToggleInputMute, cx))
                     .child(self.action_button("Set 50%", SystemAction::SetOutputVolume(50), cx));
+                for node in &self.system.audio.sinks {
+                    let name = truncate(&node.description, 22);
+                    let node_id = node.id;
+                    let current = node
+                        .volume
+                        .map_or_else(|| "—".to_string(), |volume| format!("{volume}%"));
+                    actions = actions
+                        .child(self.action_button(
+                            &format!("Output {name} {current}"),
+                            SystemAction::SetDefaultAudioSink {
+                                id: node_id,
+                                name: node.name.clone(),
+                            },
+                            cx,
+                        ))
+                        .child(self.action_button(
+                            &format!("Output {name} +10"),
+                            SystemAction::SetAudioNodeVolume {
+                                id: node_id,
+                                percent: node.volume.unwrap_or(50).saturating_add(10).min(100),
+                            },
+                            cx,
+                        ))
+                        .child(self.action_button(
+                            &format!("Output {name} -10"),
+                            SystemAction::SetAudioNodeVolume {
+                                id: node_id,
+                                percent: node.volume.unwrap_or(50).saturating_sub(10),
+                            },
+                            cx,
+                        ))
+                        .child(self.action_button(
+                            &format!("{} {}", if node.muted { "Unmute" } else { "Mute" }, name),
+                            SystemAction::ToggleAudioNodeMute { id: node_id },
+                            cx,
+                        ));
+                }
+                for node in &self.system.audio.sources {
+                    let name = truncate(&node.description, 22);
+                    actions = actions.child(self.action_button(
+                        &format!("Input {name}"),
+                        SystemAction::SetDefaultAudioSource {
+                            id: node.id,
+                            name: node.name.clone(),
+                        },
+                        cx,
+                    ));
+                }
+                for node in &self.system.audio.streams {
+                    if node.volume.is_none() {
+                        continue;
+                    }
+                    let name = truncate(
+                        if node.application.is_empty() {
+                            &node.description
+                        } else {
+                            &node.application
+                        },
+                        22,
+                    );
+                    actions = actions
+                        .child(self.action_button(
+                            &format!("Stream {name} +10"),
+                            SystemAction::SetAudioNodeVolume {
+                                id: node.id,
+                                percent: node.volume.unwrap_or(50).saturating_add(10).min(100),
+                            },
+                            cx,
+                        ))
+                        .child(self.action_button(
+                            &format!("Stream {name} -10"),
+                            SystemAction::SetAudioNodeVolume {
+                                id: node.id,
+                                percent: node.volume.unwrap_or(50).saturating_sub(10),
+                            },
+                            cx,
+                        ));
+                }
             }
             "omarchy.bluetooth" => {
                 actions = actions.child(self.action_button(
@@ -2713,6 +2791,18 @@ fn panel_rows(
                     .map(|value| format!("{value}%"))
                     .unwrap_or_else(|| "Unavailable".to_string()),
             ),
+            (
+                "Output devices".to_string(),
+                audio_node_summary(&system.audio.sinks),
+            ),
+            (
+                "Input devices".to_string(),
+                audio_node_summary(&system.audio.sources),
+            ),
+            (
+                "Playback streams".to_string(),
+                audio_node_summary(&system.audio.streams),
+            ),
         ],
         "omarchy.bluetooth" => vec![
             ("Powered".to_string(), yes_no(system.bluetooth.powered)),
@@ -2945,6 +3035,32 @@ fn display_or_dash(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn audio_node_summary(nodes: &[crate::system::AudioNode]) -> String {
+    if nodes.is_empty() {
+        return "—".to_string();
+    }
+    nodes
+        .iter()
+        .map(|node| {
+            let name = if node.application.is_empty() {
+                &node.description
+            } else {
+                &node.application
+            };
+            let volume = node
+                .volume
+                .map_or_else(|| "—".to_string(), |value| format!("{value}%"));
+            format!(
+                "{} {}{}",
+                truncate(name, 18),
+                volume,
+                if node.is_default { " ★" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn yes_no(value: bool) -> String {

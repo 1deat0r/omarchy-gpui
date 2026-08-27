@@ -100,6 +100,21 @@ pub enum SystemAction {
     ToggleOutputMute,
     ToggleInputMute,
     SetOutputVolume(u8),
+    SetAudioNodeVolume {
+        id: u32,
+        percent: u8,
+    },
+    ToggleAudioNodeMute {
+        id: u32,
+    },
+    SetDefaultAudioSink {
+        id: u32,
+        name: String,
+    },
+    SetDefaultAudioSource {
+        id: u32,
+        name: String,
+    },
     MediaPlayPause,
     MediaPlay,
     MediaPause,
@@ -160,6 +175,25 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
         SystemAction::SetOutputVolume(percent) => {
             let value = format!("{:.2}", f32::from(*percent) / 100.0);
             command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &value]).map(|_| ())
+        }
+        SystemAction::SetAudioNodeVolume { id, percent } => {
+            let id = id.to_string();
+            let value = format!("{:.2}", f32::from(*percent) / 100.0);
+            command("wpctl", &["set-volume", &id, &value]).map(|_| ())
+        }
+        SystemAction::ToggleAudioNodeMute { id } => {
+            let id = id.to_string();
+            command("wpctl", &["set-mute", &id, "toggle"]).map(|_| ())
+        }
+        SystemAction::SetDefaultAudioSink { id, name } => {
+            validate_argument(name, "audio sink")?;
+            let id = id.to_string();
+            command("omarchy-audio-output-set-default", &[&id, name]).map(|_| ())
+        }
+        SystemAction::SetDefaultAudioSource { id, name } => {
+            validate_argument(name, "audio source")?;
+            let id = id.to_string();
+            command("omarchy-audio-input-set-default", &[&id, name]).map(|_| ())
         }
         SystemAction::MediaPlayPause => media_action("PlayPause", &["-a", "play-pause"]),
         SystemAction::MediaPlay => media_action("Play", &["-a", "play"]),
@@ -337,6 +371,9 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "outputMuted": snapshot.audio.output_muted,
             "inputPercent": snapshot.audio.input_percent,
             "inputMuted": snapshot.audio.input_muted,
+            "sinks": snapshot.audio.sinks.iter().map(audio_node_value).collect::<Vec<_>>(),
+            "sources": snapshot.audio.sources.iter().map(audio_node_value).collect::<Vec<_>>(),
+            "streams": snapshot.audio.streams.iter().map(audio_node_value).collect::<Vec<_>>(),
             "error": snapshot.audio.error,
         },
         "network": {
@@ -463,6 +500,19 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
             "active": snapshot.nightlight.active,
             "error": snapshot.nightlight.error,
         },
+    })
+}
+
+fn audio_node_value(node: &AudioNode) -> Value {
+    serde_json::json!({
+        "id": node.id,
+        "name": node.name,
+        "description": node.description,
+        "application": node.application,
+        "type": node.node_type,
+        "volume": node.volume,
+        "muted": node.muted,
+        "default": node.is_default,
     })
 }
 
@@ -666,6 +716,9 @@ pub struct AudioState {
     pub output_muted: bool,
     pub input_percent: Option<u8>,
     pub input_muted: bool,
+    pub sinks: Vec<AudioNode>,
+    pub sources: Vec<AudioNode>,
+    pub streams: Vec<AudioNode>,
     pub error: Option<String>,
 }
 
@@ -675,18 +728,70 @@ pub struct AudioEndpoint {
     pub muted: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioNode {
+    pub id: u32,
+    pub name: String,
+    pub description: String,
+    pub application: String,
+    pub node_type: String,
+    pub volume: Option<u8>,
+    pub muted: bool,
+    pub is_default: bool,
+}
+
 impl AudioState {
     fn collect() -> Self {
         let output = command("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).ok();
         let input = command("wpctl", &["get-volume", "@DEFAULT_AUDIO_SOURCE@"]).ok();
-        if output.is_none() && input.is_none() {
+        let default_sink = command("wpctl", &["inspect", "@DEFAULT_AUDIO_SINK@"])
+            .ok()
+            .and_then(|raw| parse_wpctl_id(&raw));
+        let default_source = command("wpctl", &["inspect", "@DEFAULT_AUDIO_SOURCE@"])
+            .ok()
+            .and_then(|raw| parse_wpctl_id(&raw));
+        let mut inventory = command_json("pw-dump", &[])
+            .ok()
+            .map(|value| parse_pw_dump_audio(&value))
+            .unwrap_or_default();
+        for node in inventory
+            .sinks
+            .iter_mut()
+            .chain(inventory.sources.iter_mut())
+            .chain(inventory.streams.iter_mut())
+        {
+            let id = node.id.to_string();
+            if let Ok(raw) = command("wpctl", &["get-volume", &id]) {
+                let endpoint = parse_wpctl_volume(&raw);
+                node.volume = endpoint.percent;
+                node.muted = endpoint.muted;
+            }
+        }
+        if let Some(id) = default_sink {
+            if let Some(node) = inventory.sinks.iter_mut().find(|node| node.id == id) {
+                node.is_default = true;
+            }
+        }
+        if let Some(id) = default_source {
+            if let Some(node) = inventory.sources.iter_mut().find(|node| node.id == id) {
+                node.is_default = true;
+            }
+        }
+        if output.is_none()
+            && input.is_none()
+            && inventory.sinks.is_empty()
+            && inventory.sources.is_empty()
+        {
             return Self {
                 error: Some("wpctl unavailable".to_string()),
                 ..Self::default()
             };
         }
         Self {
-            available: true,
+            available: output.is_some()
+                || input.is_some()
+                || !inventory.sinks.is_empty()
+                || !inventory.sources.is_empty(),
             output_percent: output
                 .as_deref()
                 .map(parse_wpctl_volume)
@@ -703,6 +808,9 @@ impl AudioState {
                 .as_deref()
                 .map(parse_wpctl_volume)
                 .is_some_and(|endpoint| endpoint.muted),
+            sinks: inventory.sinks,
+            sources: inventory.sources,
+            streams: inventory.streams,
             error: None,
         }
     }
@@ -720,6 +828,124 @@ pub fn parse_wpctl_volume(raw: &str) -> AudioEndpoint {
         percent,
         muted: raw.split_whitespace().any(|token| token == "[MUTED]"),
     }
+}
+
+pub fn parse_wpctl_id(raw: &str) -> Option<u32> {
+    raw.lines()
+        .find_map(|line| line.trim().strip_prefix("id "))
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioInventory {
+    pub sinks: Vec<AudioNode>,
+    pub sources: Vec<AudioNode>,
+    pub streams: Vec<AudioNode>,
+}
+
+pub fn parse_pw_dump_audio(value: &Value) -> AudioInventory {
+    let mut inventory = AudioInventory::default();
+    for object in value.as_array().into_iter().flatten() {
+        if object.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let Some(info) = object.get("info") else {
+            continue;
+        };
+        let props = info.get("props").unwrap_or(&Value::Null);
+        let media_class = props
+            .get("media.class")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let node_type = if media_class == "Audio/Sink" {
+            "sink"
+        } else if media_class.starts_with("Audio/Source") {
+            "source"
+        } else if media_class.contains("Stream") && media_class.contains("Audio") {
+            "stream"
+        } else {
+            continue;
+        };
+        let Some(id) = object
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            continue;
+        };
+        let name = value_string(props, "node.name");
+        let description = props
+            .get("node.description")
+            .and_then(Value::as_str)
+            .or_else(|| props.get("node.nick").and_then(Value::as_str))
+            .or_else(|| props.get("media.name").and_then(Value::as_str))
+            .unwrap_or(&name)
+            .to_string();
+        let application = props
+            .get("application.name")
+            .and_then(Value::as_str)
+            .or_else(|| props.get("media.name").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let (volume, muted) = parse_pw_dump_volume(info.get("params"));
+        let node = AudioNode {
+            id,
+            name,
+            description,
+            application,
+            node_type: node_type.to_string(),
+            volume,
+            muted,
+            is_default: false,
+        };
+        match node_type {
+            "sink" => inventory.sinks.push(node),
+            "source" => inventory.sources.push(node),
+            _ => inventory.streams.push(node),
+        }
+    }
+    inventory
+        .sinks
+        .sort_by_key(|node| (!node.is_default, node.description.to_lowercase()));
+    inventory
+        .sources
+        .sort_by_key(|node| (!node.is_default, node.description.to_lowercase()));
+    inventory
+        .streams
+        .sort_by_key(|node| node.description.to_lowercase());
+    inventory
+}
+
+fn parse_pw_dump_volume(params: Option<&Value>) -> (Option<u8>, bool) {
+    let Some(params) = params.and_then(Value::as_array) else {
+        return (None, false);
+    };
+    for parameter in params {
+        let Some(object) = parameter.as_object() else {
+            continue;
+        };
+        let muted = object.get("mute").and_then(Value::as_bool).unwrap_or(false)
+            || object
+                .get("softMute")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let volume = object
+            .get("channelVolumes")
+            .and_then(Value::as_array)
+            .and_then(|values| {
+                let values = values.iter().filter_map(Value::as_f64).collect::<Vec<_>>();
+                (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+            })
+            .or_else(|| object.get("volume").and_then(Value::as_f64));
+        if volume.is_some() || muted {
+            return (
+                volume.map(|value| (value * 100.0).round().clamp(0.0, 100.0) as u8),
+                muted,
+            );
+        }
+    }
+    (None, false)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1636,8 +1862,8 @@ mod tests {
         parse_hyprland, parse_monitor_state, parse_network_band, parse_network_status,
         parse_network_verbose, parse_nightlight_temperature, parse_nmcli_device_status,
         parse_nmcli_radio_wifi, parse_nmcli_wifi_list, parse_playerctl_metadata,
-        parse_power_profiles, parse_system_stats, parse_text_size, parse_upower_display,
-        parse_wpctl_volume, run_action,
+        parse_power_profiles, parse_pw_dump_audio, parse_system_stats, parse_text_size,
+        parse_upower_display, parse_wpctl_id, parse_wpctl_volume, run_action,
     };
 
     #[test]
@@ -1669,6 +1895,62 @@ mod tests {
                 muted: true,
             }
         );
+    }
+
+    #[test]
+    fn parses_pipewire_audio_inventory_and_authoritative_ids() {
+        let dump = json!([
+            {
+                "id": 43,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": {
+                        "media.class": "Audio/Sink",
+                        "node.name": "alsa_output.usb",
+                        "node.description": "USB Headphones",
+                        "node.nick": "USB",
+                    },
+                    "params": [{
+                        "volume": 1.0,
+                        "mute": false,
+                        "channelVolumes": [0.3, 0.3]
+                    }]
+                }
+            },
+            {
+                "id": 77,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "spotify",
+                        "node.description": "Spotify",
+                        "application.name": "Spotify"
+                    },
+                    "params": [{
+                        "volume": 1.0,
+                        "mute": true
+                    }]
+                }
+            },
+            {
+                "id": 99,
+                "type": "PipeWire:Interface:Port",
+                "info": {}
+            }
+        ]);
+        let parsed = parse_pw_dump_audio(&dump);
+        assert_eq!(parsed.sinks.len(), 1);
+        assert_eq!(parsed.sinks[0].id, 43);
+        assert_eq!(parsed.sinks[0].volume, Some(30));
+        assert_eq!(parsed.sinks[0].description, "USB Headphones");
+        assert_eq!(parsed.streams[0].application, "Spotify");
+        assert!(parsed.streams[0].muted);
+        assert_eq!(
+            parse_wpctl_id("id 43, type PipeWire:Interface:Node\\n"),
+            Some(43)
+        );
+        assert_eq!(parse_wpctl_id("not an inspect response"), None);
     }
 
     #[test]
