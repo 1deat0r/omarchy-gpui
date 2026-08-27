@@ -22,7 +22,7 @@ use crate::overlays::{
     emoji_rows_from_path, image_rows_from_payload, parse_image_picker_payload, reminder_args,
     valid_reminder_minutes,
 };
-use crate::plugins::{IndicatorState, PluginSnapshot, parse_network_qr};
+use crate::plugins::{IndicatorState, PluginSnapshot, WeatherDay, parse_network_qr};
 use crate::system::{
     BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action, subscribe_hyprland_events,
 };
@@ -929,6 +929,7 @@ struct PanelView {
     notification_entries: Vec<NotificationEntry>,
     reminder_minutes: String,
     reminder_step_message: bool,
+    weather_editing: bool,
     calendar_year: i32,
     calendar_month: u8,
     calendar_today: (i32, u8, u8),
@@ -1053,6 +1054,11 @@ impl PanelView {
                     .unwrap_or_else(|| "root".to_string())
             })
             .unwrap_or_else(|| "root".to_string());
+        let weather_editing = id == "omarchy.weather"
+            && serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| value.get("edit").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false);
         Self {
             id,
             omarchy_path: snapshot.omarchy_path,
@@ -1074,6 +1080,7 @@ impl PanelView {
             notification_entries,
             reminder_minutes: String::new(),
             reminder_step_message: false,
+            weather_editing,
             calendar_year: calendar_today.0,
             calendar_month: calendar_today.1,
             calendar_today,
@@ -2089,6 +2096,10 @@ impl PanelView {
             self.handle_dmenu_key(event, window, cx);
             return;
         }
+        if self.id == "omarchy.weather" {
+            self.handle_weather_key(event, window, cx);
+            return;
+        }
         if self.id == "omarchy.clock" {
             self.handle_clock_key(event, window, cx);
             return;
@@ -2393,6 +2404,76 @@ impl PanelView {
             )
     }
 
+    fn start_weather_editing(&mut self, cx: &mut Context<Self>) {
+        self.weather_editing = true;
+        self.filter_text = self.plugins.weather.location.clone();
+        cx.notify();
+    }
+
+    fn handle_weather_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if !self.weather_editing {
+            match key {
+                "escape" => window.remove_window(),
+                "enter" | "return" => self.start_weather_editing(cx),
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            "escape" => {
+                self.weather_editing = false;
+                self.filter_text.clear();
+                cx.notify();
+            }
+            "backspace" => {
+                self.filter_text.pop();
+                cx.notify();
+            }
+            "enter" | "return" => self.commit_weather_location(cx),
+            _ if event.keystroke.modifiers.control
+                || event.keystroke.modifiers.alt
+                || event.keystroke.modifiers.platform => {}
+            _ => {
+                if let Some(character) = event
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .or_else(|| (!key.is_empty() && key.chars().count() == 1).then_some(key))
+                    && !character.chars().any(char::is_control)
+                {
+                    self.filter_text.push_str(character);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn commit_weather_location(&mut self, cx: &mut Context<Self>) {
+        let location = self.filter_text.trim().to_string();
+        let program = self.omarchy_program("omarchy-weather-location");
+        let result = if location.is_empty() {
+            Command::new(&program).arg("--clear").spawn()
+        } else {
+            Command::new(&program)
+                .args(["--set", location.as_str()])
+                .spawn()
+        };
+        self.message = match result {
+            Ok(_) => "Weather location update started".to_string(),
+            Err(error) => format!("{}: {error}", program.display()),
+        };
+        self.weather_editing = false;
+        self.filter_text.clear();
+        cx.notify();
+    }
+
     fn handle_clock_key(
         &mut self,
         event: &KeyDownEvent,
@@ -2525,6 +2606,111 @@ impl PanelView {
         let mut content = div().flex().flex_col().gap_3().mt_3();
         match self.id.as_str() {
             "omarchy.clock" => Some(self.clock_calendar_content(cx)),
+            "omarchy.weather" => {
+                let weather = &self.plugins.weather;
+                let temperature = if weather.temp_c.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{}°C", weather.temp_c)
+                };
+                let mut hero = div().flex().items_center().gap_3();
+                hero = hero
+                    .child(
+                        div()
+                            .w(px(56.0))
+                            .h(px(56.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgb(0x27272a))
+                            .text_size(px(34.0))
+                            .child(if weather.icon.is_empty() {
+                                "".to_string()
+                            } else {
+                                weather.icon.clone()
+                            }),
+                    )
+                    .child(panel_hero("Weather", temperature));
+                content = content.child(hero);
+
+                if self.weather_editing {
+                    content = content.child(
+                        div()
+                            .id("omarchy-gpui-weather-location-input")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x27272a))
+                            .border_1()
+                            .border_color(rgb(0x7c3aed))
+                            .text_color(if self.filter_text.is_empty() {
+                                rgb(0x71717a)
+                            } else {
+                                rgb(0xf4f4f5)
+                            })
+                            .child(if self.filter_text.is_empty() {
+                                "Type a city and press Enter…".to_string()
+                            } else {
+                                self.filter_text.clone()
+                            }),
+                    );
+                } else {
+                    let location = if weather.location.is_empty() {
+                        "Auto-detected location".to_string()
+                    } else {
+                        weather.location.to_uppercase()
+                    };
+                    content = content.child(
+                        div()
+                            .id("omarchy-gpui-weather-location")
+                            .cursor_pointer()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x27272a))
+                            .child(format!("⌖ {location}"))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.start_weather_editing(cx);
+                            })),
+                    );
+                }
+
+                if !weather.condition.is_empty() {
+                    content = content.child(panel_text_row("Condition", &weather.condition, false));
+                }
+                let feels = if weather.feels_c.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{}°C", weather.feels_c)
+                };
+                let wind = if weather.wind_kmph.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{} km/h", weather.wind_kmph)
+                };
+                let humidity = if weather.humidity.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{}%", weather.humidity)
+                };
+                content = content
+                    .child(panel_section_title("CURRENT CONDITIONS"))
+                    .child(panel_text_row("Feels like", &feels, false))
+                    .child(panel_text_row("Wind", &wind, false))
+                    .child(panel_text_row("Humidity", &humidity, false));
+                content = content.child(panel_section_title("FORECAST"));
+                if weather.forecast.is_empty() {
+                    content = content.child(panel_empty_row("Forecast unavailable"));
+                } else {
+                    let mut forecast = div().flex().gap_2();
+                    for day in &weather.forecast {
+                        forecast = forecast.child(weather_day_card(day));
+                    }
+                    content = content.child(forecast);
+                }
+                Some(content)
+            }
             "omarchy.audio" => {
                 content = content.child(panel_hero(
                     "Audio",
@@ -3556,6 +3742,63 @@ fn panel_empty_row(label: &str) -> Div {
         .child(label.to_string())
 }
 
+fn weather_day_card(day: &WeatherDay) -> Div {
+    let maximum = if day.max_c.is_empty() {
+        "—".to_string()
+    } else {
+        format!("{}°", day.max_c)
+    };
+    let minimum = if day.min_c.is_empty() {
+        "—".to_string()
+    } else {
+        format!("{}°", day.min_c)
+    };
+    div()
+        .w(px(112.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .bg(rgb(0x27272a))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(0xa1a1aa))
+                .child(forecast_day_label(&day.date)),
+        )
+        .child(div().text_size(px(24.0)).child(if day.icon.is_empty() {
+            "".to_string()
+        } else {
+            day.icon.clone()
+        }))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .child(format!("{maximum} / {minimum}")),
+        )
+}
+
+fn forecast_day_label(date: &str) -> String {
+    let mut parts = date.split('-');
+    let year = parts.next().and_then(|value| value.parse::<i32>().ok());
+    let month = parts.next().and_then(|value| value.parse::<i32>().ok());
+    let day = parts.next().and_then(|value| value.parse::<i32>().ok());
+    let Some((year, month, day)) = year
+        .zip(month)
+        .zip(day)
+        .map(|((year, month), day)| (year, month, day))
+    else {
+        return date.to_string();
+    };
+    ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+        .get(weekday_sunday(year, month, day) as usize)
+        .copied()
+        .unwrap_or("DAY")
+        .to_string()
+}
+
 fn display_or_dash(value: &str) -> String {
     if value.is_empty() || value == "--" {
         "—".to_string()
@@ -3813,7 +4056,9 @@ fn label_for_entry(
             }
         }
         "omarchy.weather" => {
-            if plugins.weather.status.is_empty() {
+            if !plugins.weather.icon.is_empty() && !plugins.weather.temp_c.is_empty() {
+                format!("{} {}°C", plugins.weather.icon, plugins.weather.temp_c)
+            } else if plugins.weather.status.is_empty() {
                 "WEATHER".to_string()
             } else {
                 truncate(&plugins.weather.status, 32)

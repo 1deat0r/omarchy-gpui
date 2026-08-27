@@ -9,6 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::Value;
@@ -210,21 +211,57 @@ pub struct WeatherState {
     pub available: bool,
     pub status: String,
     pub location: String,
+    pub country: String,
+    pub condition: String,
+    pub icon: String,
+    pub temp_c: String,
+    pub temp_f: String,
+    pub feels_c: String,
+    pub feels_f: String,
+    pub wind_kmph: String,
+    pub wind_mph: String,
+    pub humidity: String,
+    pub forecast: Vec<WeatherDay>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WeatherDay {
+    pub date: String,
+    pub max_c: String,
+    pub min_c: String,
+    pub max_f: String,
+    pub min_f: String,
+    pub icon: String,
 }
 
 impl WeatherState {
     fn collect(omarchy_path: &Path) -> Self {
-        let status = match omarchy_command(omarchy_path, "omarchy-weather-status", &[]) {
-            Ok(raw) => raw.trim().to_string(),
-            Err(error) => {
-                return Self {
+        let fallback =
+            match omarchy_command_with_status(omarchy_path, "omarchy-weather-status", &[]) {
+                Ok((success, raw)) if success => parse_weather_status(&raw),
+                Ok((_, raw)) => WeatherState {
+                    error: Some(format!("omarchy-weather-status: {}", raw.trim())),
+                    ..WeatherState::default()
+                },
+                Err(error) => WeatherState {
                     error: Some(error),
-                    ..Self::default()
-                };
+                    ..WeatherState::default()
+                },
+            };
+
+        match fetch_weather_report(omarchy_path).and_then(|raw| parse_weather_report(&raw)) {
+            Ok(mut report) => {
+                if report.status.is_empty() {
+                    report.status = fallback.status;
+                }
+                report
             }
-        };
-        parse_weather_status(&status)
+            Err(error) => WeatherState {
+                error: Some(error),
+                ..fallback
+            },
+        }
     }
 }
 
@@ -240,8 +277,254 @@ pub fn parse_weather_status(raw: &str) -> WeatherState {
         available: !status.is_empty() && !status.eq_ignore_ascii_case("weather unavailable"),
         status,
         location,
-        error: None,
+        ..WeatherState::default()
     }
+}
+
+pub fn parse_weather_report(raw: &str) -> Result<WeatherState, String> {
+    let parsed = serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("weather report returned invalid JSON: {error}"))?;
+    let current = parsed
+        .get("current_condition")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .ok_or_else(|| "weather report has no current conditions".to_string())?;
+
+    let area = parsed
+        .get("nearest_area")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first());
+    let location = nested_value_text(area, &["areaName", "0", "value"]);
+    let country = nested_value_text(area, &["country", "0", "value"]);
+    let condition = nested_value_text(Some(current), &["weatherDesc", "0", "value"]);
+    let temp_c = value_text(current.get("temp_C"));
+    let temp_f = value_text(current.get("temp_F"));
+    let feels_c = value_text(current.get("FeelsLikeC"));
+    let feels_f = value_text(current.get("FeelsLikeF"));
+    let wind_kmph = value_text(current.get("windspeedKmph"));
+    let wind_mph = value_text(current.get("windspeedMiles"));
+    let humidity = value_text(current.get("humidity"));
+    let weather_code = value_text(current.get("weatherCode"));
+    let icon = weather_icon(&weather_code, false);
+    let mut forecast = Vec::new();
+    let today = local_date_string();
+    if let Some(days) = parsed.get("weather").and_then(Value::as_array) {
+        for day in days {
+            let date = value_text(day.get("date"));
+            if date.is_empty() || (!today.is_empty() && date <= today) {
+                continue;
+            }
+            let hourly = day
+                .get("hourly")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten();
+            let mut best_hour: Option<&Value> = None;
+            let mut best_distance = i64::MAX;
+            for hour in hourly {
+                let time = value_text(hour.get("time"));
+                let numeric = time.parse::<i64>().unwrap_or_default();
+                let distance = (numeric - 1200).abs();
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_hour = Some(hour);
+                }
+            }
+            let day_code = best_hour
+                .and_then(|hour| hour.get("weatherCode"))
+                .map(|value| value_text(Some(value)))
+                .unwrap_or_default();
+            forecast.push(WeatherDay {
+                date,
+                max_c: value_text(day.get("maxtempC")),
+                min_c: value_text(day.get("mintempC")),
+                max_f: value_text(day.get("maxtempF")),
+                min_f: value_text(day.get("mintempF")),
+                icon: weather_icon(&day_code, false),
+            });
+            if forecast.len() == 3 {
+                break;
+            }
+        }
+    }
+
+    let location = if location.is_empty() {
+        "Unknown location".to_string()
+    } else {
+        location
+    };
+    let status = if !temp_c.is_empty() || !wind_kmph.is_empty() {
+        format!(
+            "{location}  ·  Temp {}°C  ·  Wind {} km/h",
+            temp_c, wind_kmph
+        )
+    } else {
+        location.clone()
+    };
+
+    Ok(WeatherState {
+        available: true,
+        status,
+        location,
+        country,
+        condition,
+        icon,
+        temp_c,
+        temp_f,
+        feels_c,
+        feels_f,
+        wind_kmph,
+        wind_mph,
+        humidity,
+        forecast,
+        error: None,
+    })
+}
+
+fn fetch_weather_report(omarchy_path: &Path) -> Result<String, String> {
+    let query = weather_location_query(omarchy_path);
+    let url = format!("https://wttr.in/{query}?format=j1");
+    let output = Command::new("curl")
+        .args(["-fsS", "--max-time", "10", &url])
+        .output()
+        .map_err(|error| format!("curl weather report: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("curl weather report exited with {}", output.status)
+        } else {
+            format!("curl weather report: {detail}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn weather_location_query(omarchy_path: &Path) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let path = home.join(".local/state/omarchy/settings/weather.json");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return String::new();
+    };
+    let latitude = value.get("latitude").and_then(Value::as_f64);
+    let longitude = value.get("longitude").and_then(Value::as_f64);
+    if let (Some(latitude), Some(longitude)) = (latitude, longitude) {
+        return format!("{latitude},{longitude}");
+    }
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty() {
+        let _ = omarchy_path;
+        String::new()
+    } else {
+        percent_encode(name)
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+fn value_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn nested_value_text(value: Option<&Value>, path: &[&str]) -> String {
+    let mut current = value;
+    for segment in path {
+        current = current.and_then(|value| {
+            value.get(*segment).or_else(|| {
+                segment
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| value.get(index))
+            })
+        });
+    }
+    value_text(current)
+}
+
+fn weather_icon(code: &str, night: bool) -> String {
+    match code.parse::<u16>().unwrap_or_default() {
+        113 => {
+            if night {
+                ""
+            } else {
+                ""
+            }
+        }
+        116 => {
+            if night {
+                ""
+            } else {
+                ""
+            }
+        }
+        119 | 122 => "",
+        143 | 248 | 260 => "",
+        176 | 263 | 353 => {
+            if night {
+                ""
+            } else {
+                ""
+            }
+        }
+        179 | 227 | 230 | 323 | 326 | 368 => {
+            if night {
+                ""
+            } else {
+                ""
+            }
+        }
+        182 | 185 | 281 | 284 | 311 | 314 | 317 | 320 | 350 | 362 | 365 | 374 | 377 => "",
+        200 | 386 | 389 | 392 | 395 => "",
+        266 | 293 | 296 | 299 | 302 | 305 | 308 | 356 | 359 => "",
+        329 | 332 | 335 | 338 | 371 => "",
+        _ => "",
+    }
+    .to_string()
+}
+
+fn local_date_string() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    #[cfg(unix)]
+    {
+        let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+        if !result.is_null() {
+            let local = unsafe { local.assume_init() };
+            return format!(
+                "{:04}-{:02}-{:02}",
+                local.tm_year + 1900,
+                local.tm_mon + 1,
+                local.tm_mday
+            );
+        }
+    }
+    String::new()
 }
 
 /// Parse the metadata header and compact 0/1 matrix emitted by
@@ -639,7 +922,7 @@ mod tests {
     use super::{
         parse_default_agent, parse_dictation_state, parse_dropbox_status, parse_keyboard_devices,
         parse_network_qr, parse_reminder_indicator, parse_tailscale_status, parse_update_status,
-        parse_weather_status,
+        parse_weather_report, parse_weather_status,
     };
 
     #[test]
@@ -651,6 +934,29 @@ mod tests {
         let weather = parse_weather_status("Auckland  ·  Temp 12°C  ·  Wind ←4km/h");
         assert!(weather.available);
         assert_eq!(weather.location, "Auckland");
+    }
+
+    #[test]
+    fn parses_weather_report_current_conditions_and_future_forecast() {
+        let weather = parse_weather_report(
+            r#"{
+                "nearest_area":[{"areaName":[{"value":"Auckland"}],"country":[{"value":"New Zealand"}]}],
+                "current_condition":[{"temp_C":"15","temp_F":"59","FeelsLikeC":"14","FeelsLikeF":"57","windspeedKmph":"12","windspeedMiles":"7","humidity":"70","weatherCode":"116","weatherDesc":[{"value":"Partly cloudy"}]}],
+                "weather":[
+                    {"date":"2099-01-01","maxtempC":"20","mintempC":"12","maxtempF":"68","mintempF":"54","hourly":[{"time":"1200","weatherCode":"113"}]},
+                    {"date":"2099-01-02","maxtempC":"21","mintempC":"13","maxtempF":"70","mintempF":"55","hourly":[{"time":"1200","weatherCode":"266"}]}
+                ]
+            }"#,
+        )
+        .expect("weather fixture should parse");
+        assert_eq!(weather.location, "Auckland");
+        assert_eq!(weather.country, "New Zealand");
+        assert_eq!(weather.temp_c, "15");
+        assert_eq!(weather.condition, "Partly cloudy");
+        assert_eq!(weather.icon, "");
+        assert_eq!(weather.forecast.len(), 2);
+        assert_eq!(weather.forecast[0].date, "2099-01-01");
+        assert_eq!(weather.forecast[1].icon, "");
     }
 
     #[test]
