@@ -24,7 +24,8 @@ use crate::overlays::{
 };
 use crate::plugins::{IndicatorState, PluginSnapshot, WeatherDay, parse_network_qr};
 use crate::system::{
-    BluetoothDeviceAction, SystemAction, SystemSnapshot, run_action, subscribe_hyprland_events,
+    BluetoothDeviceAction, SystemAction, SystemSnapshot, WifiNetwork, run_action,
+    subscribe_hyprland_events,
 };
 
 pub struct ShellView {
@@ -983,6 +984,8 @@ struct PanelView {
     weather_editing: bool,
     weather_suggestions: Vec<WeatherSuggestion>,
     weather_selected_suggestion: usize,
+    network_editor: Option<NetworkEditor>,
+    network_selected_index: usize,
     calendar_year: i32,
     calendar_month: u8,
     calendar_today: (i32, u8, u8),
@@ -1015,6 +1018,22 @@ struct WeatherSuggestion {
     description: String,
     latitude: f64,
     longitude: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NetworkEditorField {
+    Identity,
+    Passphrase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkEditor {
+    ssid: String,
+    device: String,
+    security: String,
+    identity: String,
+    passphrase: String,
+    field: NetworkEditorField,
 }
 
 impl PanelView {
@@ -1151,6 +1170,8 @@ impl PanelView {
             weather_editing,
             weather_suggestions: Vec::new(),
             weather_selected_suggestion: 0,
+            network_editor: None,
+            network_selected_index: 0,
             calendar_year: calendar_today.0,
             calendar_month: calendar_today.1,
             calendar_today,
@@ -1187,6 +1208,27 @@ impl PanelView {
             .child(label.to_string())
             .on_click(cx.listener(move |view, _, _, cx| {
                 view.execute(action.clone(), cx);
+            }))
+    }
+
+    fn network_action_button(
+        &self,
+        label: &str,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(format!("omarchy-gpui-network-action-{index}"))
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x27272a))
+            .border_1()
+            .border_color(rgb(0x3f3f46))
+            .child(label.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.activate_network_row(index, cx);
             }))
     }
 
@@ -1386,6 +1428,17 @@ impl PanelView {
                     .child(self.ipc_button("Toggle week start", &["clock", "toggleWeekStart"], cx));
             }
             "omarchy.network" => {
+                if let Some(enabled) = self.system.network.wifi_enabled {
+                    actions = actions.child(self.action_button(
+                        if enabled {
+                            "Turn Wi-Fi off"
+                        } else {
+                            "Turn Wi-Fi on"
+                        },
+                        SystemAction::SetWifiEnabled(!enabled),
+                        cx,
+                    ));
+                }
                 if !self.system.network.connection.is_empty()
                     && self.system.network.connection != "--"
                 {
@@ -1402,6 +1455,32 @@ impl PanelView {
                         cx,
                     ));
                 }
+                actions = actions
+                    .child(self.action_button(
+                        "Band auto",
+                        SystemAction::SetNetworkBand("auto".to_string()),
+                        cx,
+                    ))
+                    .child(self.action_button(
+                        "DNS DHCP",
+                        SystemAction::SetDnsProvider("DHCP".to_string()),
+                        cx,
+                    ))
+                    .child(self.action_button(
+                        "DNS Cloudflare",
+                        SystemAction::SetDnsProvider("Cloudflare".to_string()),
+                        cx,
+                    ))
+                    .child(self.action_button(
+                        "DNS Google",
+                        SystemAction::SetDnsProvider("Google".to_string()),
+                        cx,
+                    ))
+                    .child(self.action_button(
+                        "DNS Custom",
+                        SystemAction::SetDnsProvider("Custom".to_string()),
+                        cx,
+                    ));
                 if let Some(device) = self
                     .system
                     .network
@@ -1416,7 +1495,7 @@ impl PanelView {
                         cx,
                     ));
                 }
-                for network in &self.system.network.wifi_networks {
+                for (index, network) in self.system.network.wifi_networks.iter().enumerate() {
                     if network.ssid.is_empty() || network.device.is_empty() {
                         continue;
                     }
@@ -1425,15 +1504,7 @@ impl PanelView {
                     } else {
                         format!("Connect {}", network.ssid)
                     };
-                    let action = if network.connected {
-                        SystemAction::DisconnectNetwork(network.device.clone())
-                    } else {
-                        SystemAction::ConnectNetwork {
-                            ssid: network.ssid.clone(),
-                            device: network.device.clone(),
-                        }
-                    };
-                    actions = actions.child(self.action_button(&label, action, cx));
+                    actions = actions.child(self.network_action_button(&label, index, cx));
                     if network.known && !network.connected {
                         actions = actions.child(self.action_button(
                             &format!("Forget {}", network.ssid),
@@ -2161,6 +2232,229 @@ impl PanelView {
         items
     }
 
+    fn execute_async(&mut self, action: SystemAction, pending: &str, cx: &mut Context<Self>) {
+        self.message = pending.to_string();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { run_action(&action) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.message = match result {
+                    Ok(()) => "Action sent".to_string(),
+                    Err(error) => error,
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_network_editor(&mut self, network: &WifiNetwork, cx: &mut Context<Self>) {
+        let enterprise = network_security_is_enterprise(&network.security);
+        self.network_editor = Some(NetworkEditor {
+            ssid: network.ssid.clone(),
+            device: network.device.clone(),
+            security: network.security.clone(),
+            identity: String::new(),
+            passphrase: String::new(),
+            field: if enterprise {
+                NetworkEditorField::Identity
+            } else {
+                NetworkEditorField::Passphrase
+            },
+        });
+        self.message.clear();
+        cx.notify();
+    }
+
+    fn activate_network_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(network) = self.system.network.wifi_networks.get(index).cloned() else {
+            return;
+        };
+        self.network_selected_index = index;
+        if network.device.is_empty() {
+            self.message = "Wi-Fi device unavailable".to_string();
+        } else if network.connected {
+            self.execute_async(
+                SystemAction::DisconnectNetwork(network.device),
+                "Disconnecting…",
+                cx,
+            );
+        } else if network_security_requires_credentials(&network.security) && !network.known {
+            self.open_network_editor(&network, cx);
+        } else {
+            self.execute_async(
+                SystemAction::ConnectNetwork {
+                    ssid: network.ssid,
+                    device: network.device,
+                },
+                "Connecting…",
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn submit_network_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.network_editor.clone() else {
+            return;
+        };
+        if editor.passphrase.is_empty() {
+            self.message = "Enter a Wi-Fi passphrase".to_string();
+            cx.notify();
+            return;
+        }
+        let action = if network_security_is_enterprise(&editor.security) {
+            if editor.identity.trim().is_empty() {
+                self.message = "Enter an enterprise identity".to_string();
+                cx.notify();
+                return;
+            }
+            SystemAction::ConnectEnterpriseNetwork {
+                ssid: editor.ssid,
+                device: editor.device,
+                identity: editor.identity,
+                passphrase: editor.passphrase,
+            }
+        } else {
+            SystemAction::ConnectNetworkWithPassphrase {
+                ssid: editor.ssid,
+                device: editor.device,
+                passphrase: editor.passphrase,
+            }
+        };
+        self.network_editor = None;
+        self.execute_async(action, "Connecting securely…", cx);
+    }
+
+    fn handle_network_editor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                self.network_editor = None;
+                self.message.clear();
+                cx.notify();
+            }
+            "tab" => {
+                if let Some(editor) = self.network_editor.as_mut()
+                    && network_security_is_enterprise(&editor.security)
+                {
+                    editor.field = match editor.field {
+                        NetworkEditorField::Identity => NetworkEditorField::Passphrase,
+                        NetworkEditorField::Passphrase => NetworkEditorField::Identity,
+                    };
+                    cx.notify();
+                }
+            }
+            "backspace" => {
+                if let Some(editor) = self.network_editor.as_mut() {
+                    match editor.field {
+                        NetworkEditorField::Identity => {
+                            editor.identity.pop();
+                        }
+                        NetworkEditorField::Passphrase => {
+                            editor.passphrase.pop();
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+            "enter" | "return" => {
+                if let Some(editor) = self.network_editor.as_mut()
+                    && network_security_is_enterprise(&editor.security)
+                    && editor.field == NetworkEditorField::Identity
+                {
+                    editor.field = NetworkEditorField::Passphrase;
+                    cx.notify();
+                } else {
+                    self.submit_network_editor(cx);
+                }
+            }
+            _ if event.keystroke.modifiers.control
+                || event.keystroke.modifiers.alt
+                || event.keystroke.modifiers.platform => {}
+            _ => {
+                let Some(character) = event
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .or_else(|| (!key.is_empty() && key.chars().count() == 1).then_some(key))
+                else {
+                    return;
+                };
+                if character.chars().any(char::is_control) {
+                    return;
+                }
+                if let Some(editor) = self.network_editor.as_mut() {
+                    match editor.field {
+                        NetworkEditorField::Identity => editor.identity.push_str(character),
+                        NetworkEditorField::Passphrase => editor.passphrase.push_str(character),
+                    }
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn handle_network_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.network_editor.is_some() {
+            self.handle_network_editor_key(event, window, cx);
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let network_count = self.system.network.wifi_networks.len();
+        match key {
+            "escape" => window.remove_window(),
+            "up" | "k" if network_count > 0 => {
+                self.network_selected_index = self.network_selected_index.saturating_sub(1);
+                cx.notify();
+            }
+            "down" | "j" if network_count > 0 => {
+                self.network_selected_index =
+                    (self.network_selected_index + 1).min(network_count.saturating_sub(1));
+                cx.notify();
+            }
+            "enter" | "return" if network_count > 0 => {
+                self.activate_network_row(self.network_selected_index, cx);
+            }
+            "r" => {
+                let device = self.system.network.device.clone();
+                if device.is_empty() {
+                    self.message = "Wi-Fi device unavailable".to_string();
+                    cx.notify();
+                } else {
+                    self.execute_async(SystemAction::RescanWifi(device), "Scanning Wi-Fi…", cx);
+                }
+            }
+            "w" => {
+                if let Some(enabled) = self.system.network.wifi_enabled {
+                    self.execute_async(
+                        SystemAction::SetWifiEnabled(!enabled),
+                        if enabled {
+                            "Turning Wi-Fi off…"
+                        } else {
+                            "Turning Wi-Fi on…"
+                        },
+                        cx,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.dmenu.is_some() {
             self.handle_dmenu_key(event, window, cx);
@@ -2168,6 +2462,10 @@ impl PanelView {
         }
         if self.id == "omarchy.weather" {
             self.handle_weather_key(event, window, cx);
+            return;
+        }
+        if self.id == "omarchy.network" {
+            self.handle_network_key(event, window, cx);
             return;
         }
         if self.id == "omarchy.clock" {
@@ -2738,6 +3036,227 @@ impl PanelView {
             }))
     }
 
+    fn network_editor_field(
+        &self,
+        field: NetworkEditorField,
+        label: &str,
+        value: &str,
+        placeholder: &str,
+        masked: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let active = self
+            .network_editor
+            .as_ref()
+            .is_some_and(|editor| editor.field == field);
+        let display = if value.is_empty() {
+            placeholder.to_string()
+        } else if masked {
+            "•".repeat(value.chars().count())
+        } else {
+            value.to_string()
+        };
+        div()
+            .id(format!(
+                "omarchy-gpui-network-field-{}",
+                label.to_lowercase()
+            ))
+            .cursor_pointer()
+            .flex()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if active { rgb(0x3f3f46) } else { rgb(0x27272a) })
+            .border_1()
+            .border_color(if active { rgb(0x7c3aed) } else { rgb(0x3f3f46) })
+            .child(div().text_color(rgb(0xa1a1aa)).child(label.to_string()))
+            .child(
+                div()
+                    .text_color(if value.is_empty() {
+                        rgb(0x71717a)
+                    } else {
+                        rgb(0xf4f4f5)
+                    })
+                    .child(display),
+            )
+            .on_click(cx.listener(move |view, _, _, cx| {
+                if let Some(editor) = view.network_editor.as_mut() {
+                    editor.field = field.clone();
+                    cx.notify();
+                }
+            }))
+    }
+
+    fn network_editor_content(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let Some(editor) = self.network_editor.clone() else {
+            return div().id("omarchy-gpui-network-editor-empty");
+        };
+        let enterprise = network_security_is_enterprise(&editor.security);
+        let mut content = div()
+            .id("omarchy-gpui-network-editor")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .bg(rgb(0x202024))
+            .border_1()
+            .border_color(rgb(0x7c3aed))
+            .child(
+                div()
+                    .text_color(rgb(0xf4f4f5))
+                    .child(format!("CONNECT TO {}", editor.ssid)),
+            )
+            .child(div().text_size(px(11.0)).text_color(rgb(0xa1a1aa)).child(
+                if editor.security.is_empty() {
+                    "Security: protected network".to_string()
+                } else {
+                    format!("Security: {}", editor.security)
+                },
+            ));
+        if enterprise {
+            content = content.child(self.network_editor_field(
+                NetworkEditorField::Identity,
+                "Identity",
+                &editor.identity,
+                "username",
+                false,
+                cx,
+            ));
+        }
+        content = content
+            .child(self.network_editor_field(
+                NetworkEditorField::Passphrase,
+                "Passphrase",
+                &editor.passphrase,
+                "type passphrase",
+                true,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xa1a1aa))
+                    .child(if enterprise {
+                        "Tab or Enter moves between identity and passphrase; Enter connects."
+                    } else {
+                        "Enter connects; Esc cancels. The passphrase is sent to nmcli over stdin."
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("omarchy-gpui-network-connect")
+                            .cursor_pointer()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x7c3aed))
+                            .child("CONNECT")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.submit_network_editor(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("omarchy-gpui-network-cancel")
+                            .cursor_pointer()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x3f3f46))
+                            .child("CANCEL")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.network_editor = None;
+                                view.message.clear();
+                                cx.notify();
+                            })),
+                    ),
+            );
+        content
+    }
+
+    fn network_choice_button(
+        &self,
+        id: &str,
+        label: &str,
+        active: bool,
+        action: SystemAction,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id.to_string())
+            .cursor_pointer()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .bg(if active { rgb(0x7c3aed) } else { rgb(0x27272a) })
+            .border_1()
+            .border_color(if active { rgb(0xa78bfa) } else { rgb(0x3f3f46) })
+            .child(label.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.execute_async(action.clone(), "Applying network setting…", cx);
+            }))
+    }
+
+    fn network_row(
+        &self,
+        index: usize,
+        network: &WifiNetwork,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let detail = format!(
+            "{}% · {}{}{}",
+            network.signal_percent.max(0),
+            display_or_dash(&network.security),
+            if network.known { " · Saved" } else { "" },
+            if network.connected {
+                " · Connected"
+            } else {
+                ""
+            }
+        );
+        div()
+            .id(format!("omarchy-gpui-network-row-{index}"))
+            .cursor_pointer()
+            .flex()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(
+                if network.connected || self.network_selected_index == index {
+                    rgb(0x3f3f46)
+                } else {
+                    rgb(0x27272a)
+                },
+            )
+            .border_1()
+            .border_color(if self.network_selected_index == index {
+                rgb(0x7c3aed)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .text_color(rgb(0xf4f4f5))
+                    .child(truncate(&network.ssid, 44)),
+            )
+            .child(div().text_color(rgb(0xa1a1aa)).child(truncate(&detail, 48)))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.activate_network_row(index, cx);
+            }))
+    }
+
     fn rich_panel_content(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let mut content = div().flex().flex_col().gap_3().mt_3();
         match self.id.as_str() {
@@ -3018,6 +3537,47 @@ impl PanelView {
                     self.system.network.connection.clone()
                 };
                 content = content.child(panel_hero("Network", connection));
+                if self.network_editor.is_some() {
+                    content = content.child(self.network_editor_content(cx));
+                }
+                if let Some(enabled) = self.system.network.wifi_enabled {
+                    content = content.child(panel_section_title("WI-FI RADIO")).child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x27272a))
+                            .child(if enabled {
+                                "Wi-Fi enabled"
+                            } else {
+                                "Wi-Fi disabled"
+                            })
+                            .child(
+                                div()
+                                    .id("omarchy-gpui-network-radio-toggle")
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0x3f3f46))
+                                    .child(if enabled { "TURN OFF" } else { "TURN ON" })
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.execute_async(
+                                            SystemAction::SetWifiEnabled(!enabled),
+                                            if enabled {
+                                                "Turning Wi-Fi off…"
+                                            } else {
+                                                "Turning Wi-Fi on…"
+                                            },
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    );
+                }
                 content = content
                     .child(panel_section_title("SIGNAL"))
                     .child(panel_meter(
@@ -3046,43 +3606,71 @@ impl PanelView {
                 ] {
                     content = content.child(panel_text_row(label, &value, false));
                 }
-                if !self.system.network.wifi_networks.is_empty() {
+                let wifi_networks = self.system.network.wifi_networks.clone();
+                if !wifi_networks.is_empty() {
                     content = content.child(panel_section_title("WI-FI NETWORKS"));
-                    for network in &self.system.network.wifi_networks {
+                    for (index, network) in wifi_networks.iter().enumerate() {
                         if network.ssid.is_empty() {
                             continue;
                         }
-                        let detail = format!(
-                            "{}% · {}{}",
-                            network.signal_percent.max(0),
-                            display_or_dash(&network.security),
-                            if network.connected {
-                                " · Connected"
-                            } else {
-                                ""
-                            }
-                        );
-                        content = content.child(panel_text_row(
-                            &network.ssid,
-                            &detail,
-                            network.connected,
-                        ));
+                        content = content.child(self.network_row(index, network, cx));
                     }
                 }
-                if !self.system.network.band.available.is_empty() {
+                if !self.system.network.band.available.is_empty()
+                    || !self.system.network.band.selected.is_empty()
+                {
+                    let mut bands = div().flex().gap_2();
+                    let selected_band = if self.system.network.band.selected.is_empty() {
+                        "auto"
+                    } else {
+                        self.system.network.band.selected.as_str()
+                    };
+                    bands = bands.child(self.network_choice_button(
+                        "omarchy-gpui-network-band-auto",
+                        "Auto",
+                        selected_band == "auto",
+                        SystemAction::SetNetworkBand("auto".to_string()),
+                        cx,
+                    ));
+                    for (index, band) in self.system.network.band.available.iter().enumerate() {
+                        bands = bands.child(self.network_choice_button(
+                            &format!("omarchy-gpui-network-band-{index}"),
+                            &format!("{band}GHz"),
+                            selected_band == band,
+                            SystemAction::SetNetworkBand(band.clone()),
+                            cx,
+                        ));
+                    }
                     content = content
                         .child(panel_section_title("WI-FI BAND"))
-                        .child(panel_text_row(
-                            "Selected",
-                            &display_or_dash(&self.system.network.band.selected),
-                            false,
-                        ))
+                        .child(bands)
                         .child(panel_text_row(
                             "Current",
                             &display_or_dash(&self.system.network.band.current),
                             false,
                         ));
                 }
+                let dns_provider = if self.system.network.dns_provider.is_empty() {
+                    "DHCP"
+                } else {
+                    self.system.network.dns_provider.as_str()
+                };
+                let mut dns = div().flex().gap_2();
+                for (index, provider) in ["DHCP", "Cloudflare", "Google", "Custom"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    dns = dns.child(self.network_choice_button(
+                        &format!("omarchy-gpui-network-dns-{index}"),
+                        provider,
+                        dns_provider.eq_ignore_ascii_case(provider),
+                        SystemAction::SetDnsProvider(provider.to_string()),
+                        cx,
+                    ));
+                }
+                content = content
+                    .child(panel_section_title("DNS PROVIDER"))
+                    .child(dns);
                 Some(content)
             }
             "omarchy.power" => {
@@ -3939,6 +4527,16 @@ fn panel_empty_row(label: &str) -> Div {
         .child(label.to_string())
 }
 
+fn network_security_requires_credentials(security: &str) -> bool {
+    let normalized = security.trim().to_ascii_uppercase();
+    !normalized.is_empty() && normalized != "OPEN" && normalized != "OWE"
+}
+
+fn network_security_is_enterprise(security: &str) -> bool {
+    let normalized = security.to_ascii_uppercase();
+    normalized.contains("EAP") || normalized.contains("802.1X")
+}
+
 fn weather_day_card(day: &WeatherDay) -> Div {
     let maximum = if day.max_c.is_empty() {
         "—".to_string()
@@ -4365,6 +4963,7 @@ mod tests {
 
     use super::{
         NotificationEntry, format_clock_pattern, menu_label, menu_matches_filter,
+        network_security_is_enterprise, network_security_requires_credentials,
         notification_lifetime, parse_notification_history, parse_osd_payload,
         parse_weather_geocode,
     };
@@ -4418,6 +5017,17 @@ mod tests {
         assert_eq!(suggestions[0].name, "Auckland");
         assert_eq!(suggestions[0].description, "Auckland, New Zealand");
         assert!(parse_weather_geocode("not-json").is_empty());
+    }
+
+    #[test]
+    fn network_security_routes_open_psk_and_enterprise_rows() {
+        assert!(!network_security_requires_credentials(""));
+        assert!(!network_security_requires_credentials("Open"));
+        assert!(!network_security_requires_credentials("OWE"));
+        assert!(network_security_requires_credentials("WPA2"));
+        assert!(network_security_is_enterprise("WPA2-EAP"));
+        assert!(network_security_is_enterprise("802.1X"));
+        assert!(!network_security_is_enterprise("WPA2 WPA3"));
     }
 
     #[test]
