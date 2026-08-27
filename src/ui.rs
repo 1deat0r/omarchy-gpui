@@ -1376,40 +1376,35 @@ impl PanelView {
                 for device in &self.system.bluetooth.devices {
                     let action = if device.connected {
                         BluetoothDeviceAction::Disconnect
-                    } else {
+                    } else if device.paired {
                         BluetoothDeviceAction::Connect
-                    };
-                    let label = if device.connected {
-                        format!("Disconnect {}", device.name)
                     } else {
-                        format!("Connect {}", device.name)
+                        BluetoothDeviceAction::Pair
                     };
+                    let verb = match &action {
+                        BluetoothDeviceAction::Disconnect => "Disconnect",
+                        BluetoothDeviceAction::Connect => "Connect",
+                        BluetoothDeviceAction::Pair => "Pair",
+                        BluetoothDeviceAction::Forget => "Forget",
+                    };
+                    let label = format!("{verb} {}", device.name);
                     actions = actions.child(self.action_button(
                         &label,
                         SystemAction::BluetoothDevice {
-                            action,
+                            action: action.clone(),
                             address: device.address.clone(),
                         },
                         cx,
                     ));
-                    if !device.connected {
-                        actions = actions
-                            .child(self.action_button(
-                                &format!("Pair {}", device.name),
-                                SystemAction::BluetoothDevice {
-                                    action: BluetoothDeviceAction::Pair,
-                                    address: device.address.clone(),
-                                },
-                                cx,
-                            ))
-                            .child(self.action_button(
-                                &format!("Forget {}", device.name),
-                                SystemAction::BluetoothDevice {
-                                    action: BluetoothDeviceAction::Forget,
-                                    address: device.address.clone(),
-                                },
-                                cx,
-                            ));
+                    if device.paired && !device.connected {
+                        actions = actions.child(self.action_button(
+                            &format!("Forget {}", device.name),
+                            SystemAction::BluetoothDevice {
+                                action: BluetoothDeviceAction::Forget,
+                                address: device.address.clone(),
+                            },
+                            cx,
+                        ));
                     }
                 }
             }
@@ -3257,6 +3252,81 @@ impl PanelView {
             }))
     }
 
+    fn bluetooth_row(
+        &self,
+        index: usize,
+        device: &crate::system::BluetoothDevice,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let action = if device.connected {
+            BluetoothDeviceAction::Disconnect
+        } else if device.paired {
+            BluetoothDeviceAction::Connect
+        } else {
+            BluetoothDeviceAction::Pair
+        };
+        let verb = match &action {
+            BluetoothDeviceAction::Disconnect => "Disconnect",
+            BluetoothDeviceAction::Connect => "Connect",
+            BluetoothDeviceAction::Pair => "Pair",
+            BluetoothDeviceAction::Forget => "Forget",
+        };
+        let pending = match &action {
+            BluetoothDeviceAction::Disconnect => "Disconnecting Bluetooth device…",
+            BluetoothDeviceAction::Connect => "Connecting Bluetooth device…",
+            BluetoothDeviceAction::Pair => "Pairing Bluetooth device…",
+            BluetoothDeviceAction::Forget => "Forgetting Bluetooth device…",
+        };
+        let detail = if device.connected {
+            "Connected".to_string()
+        } else if device.paired {
+            "Paired".to_string()
+        } else {
+            "Available".to_string()
+        };
+        let address = device.address.clone();
+        div()
+            .id(format!("omarchy-gpui-bluetooth-row-{index}"))
+            .cursor_pointer()
+            .flex()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if device.connected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(rgb(0x3f3f46))
+            .child(
+                div()
+                    .text_color(rgb(0xf4f4f5))
+                    .child(if device.name.is_empty() {
+                        address.clone()
+                    } else {
+                        device.name.clone()
+                    }),
+            )
+            .child(
+                div()
+                    .text_color(rgb(0xa1a1aa))
+                    .child(format!("{verb} · {detail}")),
+            )
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.execute_async(
+                    SystemAction::BluetoothDevice {
+                        action: action.clone(),
+                        address: address.clone(),
+                    },
+                    pending,
+                    cx,
+                );
+            }))
+    }
+
     fn rich_panel_content(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let mut content = div().flex().flex_col().gap_3().mt_3();
         match self.id.as_str() {
@@ -3463,20 +3533,53 @@ impl PanelView {
                         "Powered off".to_string()
                     },
                 ));
+                content = content.child(
+                    div()
+                        .id("omarchy-gpui-bluetooth-power")
+                        .cursor_pointer()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(0x27272a))
+                        .child(if self.system.bluetooth.powered {
+                            "Bluetooth enabled"
+                        } else {
+                            "Bluetooth disabled"
+                        })
+                        .child(
+                            div()
+                                .id("omarchy-gpui-bluetooth-power-toggle")
+                                .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x3f3f46))
+                                .child(if self.system.bluetooth.powered {
+                                    "TURN OFF"
+                                } else {
+                                    "TURN ON"
+                                })
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.execute_async(
+                                        SystemAction::SetBluetoothPower(
+                                            !view.system.bluetooth.powered,
+                                        ),
+                                        "Updating Bluetooth power…",
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
                 content = content.child(panel_section_title("DEVICES"));
-                if self.system.bluetooth.devices.is_empty() {
+                let bluetooth_devices = self.system.bluetooth.devices.clone();
+                if bluetooth_devices.is_empty() {
                     content = content.child(panel_empty_row("No discovered devices"));
                 } else {
-                    for device in &self.system.bluetooth.devices {
-                        content = content.child(panel_text_row(
-                            &device.name,
-                            if device.connected {
-                                "Connected"
-                            } else {
-                                "Available"
-                            },
-                            device.connected,
-                        ));
+                    for (index, device) in bluetooth_devices.iter().enumerate() {
+                        content = content.child(self.bluetooth_row(index, device, cx));
                     }
                 }
                 Some(content)

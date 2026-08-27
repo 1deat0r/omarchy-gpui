@@ -570,6 +570,8 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
                 "address": device.address,
                 "name": device.name,
                 "connected": device.connected,
+                "paired": device.paired,
+                "trusted": device.trusted,
             })).collect::<Vec<_>>(),
             "error": snapshot.bluetooth.error,
         },
@@ -1434,7 +1436,14 @@ impl BluetoothState {
         };
         let connected_raw = command("bluetoothctl", &["devices", "Connected"]).unwrap_or_default();
         let devices_raw = command("bluetoothctl", &["devices"]).unwrap_or_default();
-        let devices = parse_bluetooth_devices(&devices_raw, &connected_raw);
+        let mut devices = parse_bluetooth_devices(&devices_raw, &connected_raw);
+        for device in &mut devices {
+            if let Ok(raw) = command("bluetoothctl", &["info", &device.address]) {
+                let info = parse_bluetooth_device_info(&raw);
+                device.paired = info.paired;
+                device.trusted = info.trusted;
+            }
+        }
         let mut state = parse_bluetooth_show(&show, devices.len());
         state.devices = devices;
         state
@@ -1463,6 +1472,8 @@ pub struct BluetoothDevice {
     pub address: String,
     pub name: String,
     pub connected: bool,
+    pub paired: bool,
+    pub trusted: bool,
 }
 
 pub fn parse_bluetooth_devices(all_raw: &str, connected_raw: &str) -> Vec<BluetoothDevice> {
@@ -1502,7 +1513,30 @@ fn parse_bluetooth_device_line(line: &str) -> Option<BluetoothDevice> {
         address: address.to_string(),
         name: fields.next().unwrap_or_default().trim().to_string(),
         connected: false,
+        paired: true,
+        trusted: false,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BluetoothDeviceInfo {
+    pub paired: bool,
+    pub trusted: bool,
+}
+
+pub fn parse_bluetooth_device_info(raw: &str) -> BluetoothDeviceInfo {
+    BluetoothDeviceInfo {
+        paired: raw.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("Paired:")
+                .is_some_and(|value| value.trim() == "yes")
+        }),
+        trusted: raw.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("Trusted:")
+                .is_some_and(|value| value.trim() == "yes")
+        }),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2052,12 +2086,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SystemAction, parse_battery_shell, parse_bluetooth_devices, parse_bluetooth_show,
-        parse_hyprland, parse_monitor_state, parse_network_band, parse_network_status,
-        parse_network_verbose, parse_nightlight_temperature, parse_nmcli_device_status,
-        parse_nmcli_radio_wifi, parse_nmcli_saved_wifi_profiles, parse_nmcli_wifi_list,
-        parse_playerctl_metadata, parse_power_profiles, parse_pw_dump_audio, parse_system_stats,
-        parse_text_size, parse_upower_display, parse_wpctl_id, parse_wpctl_volume, run_action,
+        SystemAction, parse_battery_shell, parse_bluetooth_device_info, parse_bluetooth_devices,
+        parse_bluetooth_show, parse_hyprland, parse_monitor_state, parse_network_band,
+        parse_network_status, parse_network_verbose, parse_nightlight_temperature,
+        parse_nmcli_device_status, parse_nmcli_radio_wifi, parse_nmcli_saved_wifi_profiles,
+        parse_nmcli_wifi_list, parse_playerctl_metadata, parse_power_profiles, parse_pw_dump_audio,
+        parse_system_stats, parse_text_size, parse_upower_display, parse_wpctl_id,
+        parse_wpctl_volume, run_action,
     };
 
     #[test]
@@ -2229,6 +2264,17 @@ mod tests {
         assert_eq!(devices[0].name, "Headphones");
         assert!(devices[0].connected);
         assert!(!devices[1].connected);
+    }
+
+    #[test]
+    fn parses_bluetooth_pairing_and_trust_state() {
+        let info = parse_bluetooth_device_info("Device AA:BB\n\tPaired: yes\n\tTrusted: yes\n");
+        assert!(info.paired);
+        assert!(info.trusted);
+        assert_eq!(
+            parse_bluetooth_device_info("Paired: no\nTrusted: no\n"),
+            Default::default()
+        );
     }
 
     #[test]
