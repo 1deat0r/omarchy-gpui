@@ -115,6 +115,7 @@ pub enum IpcEvent {
     Hide { id: String },
     Toggle { id: String, payload: String },
     Lock { preview: bool },
+    Notification { entry: String },
     NotificationHistory { entries: String },
 }
 
@@ -171,6 +172,7 @@ struct CommandOutcome {
 pub struct IpcServer {
     path: PathBuf,
     stop: Arc<AtomicBool>,
+    event_tx: Sender<IpcEvent>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -203,12 +205,13 @@ impl IpcServer {
         let thread_stop = Arc::clone(&stop);
         let state = Arc::new(Mutex::new(IpcRuntime::new(snapshot)));
         let (event_tx, event_rx) = mpsc::channel();
+        let thread_events = event_tx.clone();
         let thread = thread::Builder::new()
             .name("omarchy-gpui-ipc".to_string())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
-                        Ok((stream, _)) => handle_connection(stream, &state, &event_tx),
+                        Ok((stream, _)) => handle_connection(stream, &state, &thread_events),
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(25));
                         }
@@ -222,10 +225,15 @@ impl IpcServer {
             Self {
                 path,
                 stop,
+                event_tx,
                 thread: Some(thread),
             },
             Arc::new(Mutex::new(event_rx)),
         ))
+    }
+
+    pub fn event_sender(&self) -> Sender<IpcEvent> {
+        self.event_tx.clone()
     }
 }
 

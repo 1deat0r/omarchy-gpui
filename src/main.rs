@@ -2,6 +2,7 @@ mod config;
 mod dbus;
 mod ipc;
 mod menu;
+mod notifications;
 mod overlays;
 mod plugins;
 mod system;
@@ -150,11 +151,13 @@ fn run_shell(snapshot: ShellSnapshot, smoke: bool) {
         (px(8.0), px(12.0), px(0.0), px(12.0))
     };
 
-    let (_ipc_server, ipc_events) =
+    let (ipc_server, ipc_events) =
         ipc::IpcServer::start(snapshot.clone()).unwrap_or_else(|error| {
             eprintln!("omarchy-gpui-shell: {error}");
             std::process::exit(2);
         });
+    let _notification_server =
+        notifications::start(&snapshot.user_config_path, ipc_server.event_sender());
 
     application().run(move |cx: &mut App| {
         let window_options = WindowOptions {

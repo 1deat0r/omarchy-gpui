@@ -516,6 +516,10 @@ impl ShellView {
                 }
             }
             IpcEvent::Lock { .. } => {}
+            IpcEvent::Notification { entry } => {
+                self.close_panel(cx);
+                self.open_panel("omarchy.notifications", &format!("[{entry}]"), cx);
+            }
             IpcEvent::NotificationHistory { entries } => {
                 self.close_panel(cx);
                 self.open_panel("omarchy.notifications", &entries, cx);

@@ -153,7 +153,14 @@ registered by a loaded plugin.
 
 ## Current measured gap
 
-The current GPUI code only demonstrates a bar surface, configuration projection,
-clock, a plugin-id list derived from the bar, and a command parser. It does not
-yet satisfy any complete plugin row or system integration row above. The
-parity gates must remain unmet until that changes.
+The repository now has measured foundation slices for the bar surface,
+configuration projection, clock, plugin discovery, shell IPC, Hyprland raw
+events, MPRIS, StatusNotifier tray discovery/actions, and the optional
+freedesktop notification service. These slices are intentionally documented in
+their own source and runtime checks.
+
+They do not yet satisfy complete plugin rows or the full system-integration
+rows above: popup visuals, action dispatch, nested tray menus, expiry and
+history lifecycle, multi-output behavior, failure-path coverage, and
+replacement/rollback remain open. The parity gates must remain unmet until
+those behaviors are implemented and verified.
