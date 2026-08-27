@@ -1513,7 +1513,7 @@ fn parse_bluetooth_device_line(line: &str) -> Option<BluetoothDevice> {
         address: address.to_string(),
         name: fields.next().unwrap_or_default().trim().to_string(),
         connected: false,
-        paired: true,
+        paired: false,
         trusted: false,
     })
 }

@@ -989,6 +989,11 @@ struct PanelView {
     audio_focus_section: String,
     audio_selected_index: i32,
     audio_cursor_active: bool,
+    bluetooth_focus_section: String,
+    bluetooth_selected_index: usize,
+    bluetooth_action_focused: bool,
+    bluetooth_cursor_active: bool,
+    bluetooth_discovery_active: bool,
     speed_test: SpeedTestState,
     disk_speed_test: DiskSpeedTestState,
     gallery_selected_index: usize,
@@ -1179,6 +1184,14 @@ impl PanelView {
                 .unwrap_or(false);
         let start_speed_test = id == "omarchy.speedtest";
         let start_disk_speed_test = id == "omarchy.disk-speedtest";
+        let bluetooth_discovery_active = if id == "omarchy.bluetooth" {
+            Command::new("bluetoothctl")
+                .args(["scan", "on"])
+                .spawn()
+                .is_ok()
+        } else {
+            false
+        };
         let mut view = Self {
             id,
             omarchy_path: snapshot.omarchy_path,
@@ -1208,6 +1221,11 @@ impl PanelView {
             audio_focus_section: "output".to_string(),
             audio_selected_index: -1,
             audio_cursor_active: false,
+            bluetooth_focus_section: "header".to_string(),
+            bluetooth_selected_index: 0,
+            bluetooth_action_focused: false,
+            bluetooth_cursor_active: false,
+            bluetooth_discovery_active,
             speed_test: SpeedTestState::default(),
             disk_speed_test: DiskSpeedTestState::default(),
             gallery_selected_index: 0,
@@ -1424,13 +1442,7 @@ impl PanelView {
                     cx,
                 ));
                 for device in &self.system.bluetooth.devices {
-                    let action = if device.connected {
-                        BluetoothDeviceAction::Disconnect
-                    } else if device.paired {
-                        BluetoothDeviceAction::Connect
-                    } else {
-                        BluetoothDeviceAction::Pair
-                    };
+                    let action = Self::bluetooth_action(device);
                     let verb = match &action {
                         BluetoothDeviceAction::Disconnect => "Disconnect",
                         BluetoothDeviceAction::Connect => "Connect",
@@ -1446,7 +1458,7 @@ impl PanelView {
                         },
                         cx,
                     ));
-                    if device.paired && !device.connected {
+                    if (device.paired || device.trusted) && !device.connected {
                         actions = actions.child(self.action_button(
                             &format!("Forget {}", device.name),
                             SystemAction::BluetoothDevice {
@@ -3051,6 +3063,178 @@ impl PanelView {
             }))
     }
 
+    fn bluetooth_action(device: &crate::system::BluetoothDevice) -> BluetoothDeviceAction {
+        if device.connected {
+            BluetoothDeviceAction::Disconnect
+        } else if device.paired || device.trusted {
+            BluetoothDeviceAction::Connect
+        } else {
+            BluetoothDeviceAction::Pair
+        }
+    }
+
+    fn bluetooth_pending(action: &BluetoothDeviceAction) -> &'static str {
+        match action {
+            BluetoothDeviceAction::Disconnect => "Disconnecting Bluetooth device…",
+            BluetoothDeviceAction::Connect => "Connecting Bluetooth device…",
+            BluetoothDeviceAction::Pair => "Pairing Bluetooth device…",
+            BluetoothDeviceAction::Forget => "Forgetting Bluetooth device…",
+        }
+    }
+
+    fn handle_bluetooth_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let device_count = self.system.bluetooth.devices.len();
+        match key {
+            "escape" => window.remove_window(),
+            "up" | "k" => {
+                if self.bluetooth_focus_section == "devices" {
+                    if self.bluetooth_selected_index == 0 {
+                        self.bluetooth_focus_section = "header".to_string();
+                        self.bluetooth_action_focused = false;
+                    } else {
+                        self.bluetooth_selected_index -= 1;
+                    }
+                    self.bluetooth_cursor_active = true;
+                    cx.notify();
+                }
+            }
+            "down" | "j" => {
+                if self.bluetooth_focus_section == "header" {
+                    if device_count > 0 {
+                        self.bluetooth_focus_section = "devices".to_string();
+                        self.bluetooth_selected_index = 0;
+                    }
+                } else if device_count > 0 {
+                    self.bluetooth_selected_index =
+                        (self.bluetooth_selected_index + 1).min(device_count - 1);
+                }
+                self.bluetooth_cursor_active = true;
+                cx.notify();
+            }
+            "left" | "h" => {
+                self.bluetooth_action_focused = false;
+                self.bluetooth_cursor_active = true;
+                cx.notify();
+            }
+            "right" | "l" => {
+                if self.bluetooth_focus_section == "devices"
+                    && self
+                        .system
+                        .bluetooth
+                        .devices
+                        .get(self.bluetooth_selected_index)
+                        .is_some_and(|device| device.connected || device.paired || device.trusted)
+                {
+                    self.bluetooth_action_focused = true;
+                }
+                self.bluetooth_cursor_active = true;
+                cx.notify();
+            }
+            "b" | "B" => {
+                self.execute_async(
+                    SystemAction::SetBluetoothPower(!self.system.bluetooth.powered),
+                    "Updating Bluetooth power…",
+                    cx,
+                );
+            }
+            "x" | "delete" => {
+                if self.bluetooth_focus_section == "devices"
+                    && let Some(device) = self
+                        .system
+                        .bluetooth
+                        .devices
+                        .get(self.bluetooth_selected_index)
+                    && (device.paired || device.trusted || device.connected)
+                {
+                    self.execute_async(
+                        SystemAction::BluetoothDevice {
+                            action: BluetoothDeviceAction::Forget,
+                            address: device.address.clone(),
+                        },
+                        Self::bluetooth_pending(&BluetoothDeviceAction::Forget),
+                        cx,
+                    );
+                }
+            }
+            "enter" | "return" | "space" => {
+                if self.bluetooth_focus_section == "header" {
+                    self.execute_async(
+                        SystemAction::SetBluetoothPower(!self.system.bluetooth.powered),
+                        "Updating Bluetooth power…",
+                        cx,
+                    );
+                } else if let Some(device) = self
+                    .system
+                    .bluetooth
+                    .devices
+                    .get(self.bluetooth_selected_index)
+                {
+                    let action = if self.bluetooth_action_focused {
+                        BluetoothDeviceAction::Forget
+                    } else {
+                        Self::bluetooth_action(device)
+                    };
+                    self.execute_async(
+                        SystemAction::BluetoothDevice {
+                            action: action.clone(),
+                            address: device.address.clone(),
+                        },
+                        Self::bluetooth_pending(&action),
+                        cx,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn bluetooth_power_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let selected = self.bluetooth_cursor_active && self.bluetooth_focus_section == "header";
+        let powered = self.system.bluetooth.powered;
+        div()
+            .id("omarchy-gpui-bluetooth-power")
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(if powered {
+                "Bluetooth enabled"
+            } else {
+                "Bluetooth disabled"
+            })
+            .child(if powered { "TURN OFF" } else { "TURN ON" })
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.bluetooth_focus_section = "header".to_string();
+                view.bluetooth_cursor_active = true;
+                view.execute_async(
+                    SystemAction::SetBluetoothPower(!powered),
+                    "Updating Bluetooth power…",
+                    cx,
+                );
+            }))
+    }
+
     fn handle_gallery_key(
         &mut self,
         event: &KeyDownEvent,
@@ -3118,6 +3302,10 @@ impl PanelView {
         }
         if self.id == "omarchy.audio" {
             self.handle_audio_key(event, window, cx);
+            return;
+        }
+        if self.id == "omarchy.bluetooth" {
+            self.handle_bluetooth_key(event, window, cx);
             return;
         }
         if self.id == "omarchy.dev-gallery" {
@@ -4164,33 +4352,26 @@ impl PanelView {
         device: &crate::system::BluetoothDevice,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let action = if device.connected {
-            BluetoothDeviceAction::Disconnect
-        } else if device.paired {
-            BluetoothDeviceAction::Connect
-        } else {
-            BluetoothDeviceAction::Pair
-        };
+        let action = Self::bluetooth_action(device);
         let verb = match &action {
             BluetoothDeviceAction::Disconnect => "Disconnect",
             BluetoothDeviceAction::Connect => "Connect",
             BluetoothDeviceAction::Pair => "Pair",
             BluetoothDeviceAction::Forget => "Forget",
         };
-        let pending = match &action {
-            BluetoothDeviceAction::Disconnect => "Disconnecting Bluetooth device…",
-            BluetoothDeviceAction::Connect => "Connecting Bluetooth device…",
-            BluetoothDeviceAction::Pair => "Pairing Bluetooth device…",
-            BluetoothDeviceAction::Forget => "Forgetting Bluetooth device…",
-        };
+        let pending = Self::bluetooth_pending(&action);
         let detail = if device.connected {
             "Connected".to_string()
-        } else if device.paired {
+        } else if device.paired || device.trusted {
             "Paired".to_string()
         } else {
             "Available".to_string()
         };
         let address = device.address.clone();
+        let selected = self.bluetooth_cursor_active
+            && self.bluetooth_focus_section == "devices"
+            && self.bluetooth_selected_index == index;
+        let action_for_click = action.clone();
         div()
             .id(format!("omarchy-gpui-bluetooth-row-{index}"))
             .cursor_pointer()
@@ -4200,13 +4381,17 @@ impl PanelView {
             .px_3()
             .py_2()
             .rounded_md()
-            .bg(if device.connected {
+            .bg(if selected || device.connected {
                 rgb(0x3f3f46)
             } else {
                 rgb(0x27272a)
             })
             .border_1()
-            .border_color(rgb(0x3f3f46))
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
             .child(
                 div()
                     .text_color(rgb(0xf4f4f5))
@@ -4222,9 +4407,12 @@ impl PanelView {
                     .child(format!("{verb} · {detail}")),
             )
             .on_click(cx.listener(move |view, _, _, cx| {
+                view.bluetooth_focus_section = "devices".to_string();
+                view.bluetooth_selected_index = index;
+                view.bluetooth_cursor_active = true;
                 view.execute_async(
                     SystemAction::BluetoothDevice {
-                        action: action.clone(),
+                        action: action_for_click.clone(),
                         address: address.clone(),
                     },
                     pending,
@@ -4573,46 +4761,7 @@ impl PanelView {
                         "Powered off".to_string()
                     },
                 ));
-                content = content.child(
-                    div()
-                        .id("omarchy-gpui-bluetooth-power")
-                        .cursor_pointer()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x27272a))
-                        .child(if self.system.bluetooth.powered {
-                            "Bluetooth enabled"
-                        } else {
-                            "Bluetooth disabled"
-                        })
-                        .child(
-                            div()
-                                .id("omarchy-gpui-bluetooth-power-toggle")
-                                .cursor_pointer()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(0x3f3f46))
-                                .child(if self.system.bluetooth.powered {
-                                    "TURN OFF"
-                                } else {
-                                    "TURN ON"
-                                })
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.execute_async(
-                                        SystemAction::SetBluetoothPower(
-                                            !view.system.bluetooth.powered,
-                                        ),
-                                        "Updating Bluetooth power…",
-                                        cx,
-                                    );
-                                })),
-                        ),
-                );
+                content = content.child(self.bluetooth_power_row(cx));
                 content = content.child(panel_section_title("DEVICES"));
                 let bluetooth_devices = self.system.bluetooth.devices.clone();
                 if bluetooth_devices.is_empty() {
@@ -5156,6 +5305,14 @@ impl PanelView {
                 Some(content)
             }
             _ => None,
+        }
+    }
+}
+
+impl Drop for PanelView {
+    fn drop(&mut self) {
+        if self.bluetooth_discovery_active {
+            let _ = Command::new("bluetoothctl").args(["scan", "off"]).spawn();
         }
     }
 }
