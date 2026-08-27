@@ -3673,6 +3673,91 @@ impl PanelView {
                     .child(dns);
                 Some(content)
             }
+            "omarchy.dropbox" => {
+                let dropbox = &self.plugins.dropbox;
+                let status = if !dropbox.installed {
+                    "Not installed".to_string()
+                } else if !dropbox.authenticated {
+                    "Login required".to_string()
+                } else if dropbox.running {
+                    "Syncing".to_string()
+                } else {
+                    "Paused".to_string()
+                };
+                content = content.child(panel_hero("Dropbox", status));
+                content = content
+                    .child(panel_section_title("ACCOUNT"))
+                    .child(panel_text_row(
+                        "Status",
+                        &display_or_dash(&dropbox.status_text),
+                        dropbox.running,
+                    ))
+                    .child(panel_text_row(
+                        "Plan",
+                        &display_or_dash(&dropbox.plan),
+                        false,
+                    ))
+                    .child(panel_text_row(
+                        "Path",
+                        &display_or_dash(&dropbox.account_path),
+                        false,
+                    ));
+                if dropbox.quota_known {
+                    content = content
+                        .child(panel_section_title("STORAGE"))
+                        .child(panel_meter(
+                            Some(dropbox.usage_percent.round().clamp(0.0, 100.0) as u8),
+                            false,
+                        ))
+                        .child(panel_text_row(
+                            "Used",
+                            &format_bytes(dropbox.used_bytes),
+                            false,
+                        ))
+                        .child(panel_text_row(
+                            "Quota",
+                            &format_bytes(dropbox.quota_bytes),
+                            false,
+                        ));
+                }
+                if let Some(error) = &dropbox.error {
+                    content = content.child(panel_empty_row(&format!("Error: {error}")));
+                }
+                Some(content)
+            }
+            "omarchy.tailscale" => {
+                let tailscale = &self.plugins.tailscale;
+                content = content.child(panel_hero(
+                    "Tailscale",
+                    if tailscale.installed {
+                        display_or_dash(&tailscale.status)
+                    } else {
+                        "Not installed".to_string()
+                    },
+                ));
+                content = content
+                    .child(panel_section_title("NETWORK"))
+                    .child(panel_text_row(
+                        "Backend",
+                        &display_or_dash(&tailscale.backend_state),
+                        tailscale.running,
+                    ))
+                    .child(panel_text_row(
+                        "Device",
+                        &display_or_dash(&tailscale.self_name),
+                        false,
+                    ))
+                    .child(panel_text_row("Peers", &tailscale.peers.to_string(), false));
+                if tailscale.needs_login {
+                    content = content.child(panel_empty_row(
+                        "Tailscale needs login; run `tailscale up` to authenticate.",
+                    ));
+                }
+                if let Some(error) = &tailscale.error {
+                    content = content.child(panel_empty_row(&format!("Error: {error}")));
+                }
+                Some(content)
+            }
             "omarchy.power" => {
                 let battery = self.system.battery.percentage.map_or_else(
                     || "Battery unavailable".to_string(),
@@ -4527,6 +4612,22 @@ fn panel_empty_row(label: &str) -> Div {
         .child(label.to_string())
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = bytes as f64;
+    if value < KIB {
+        format!("{bytes} B")
+    } else if value < MIB {
+        format!("{:.1} KiB", value / KIB)
+    } else if value < GIB {
+        format!("{:.1} MiB", value / MIB)
+    } else {
+        format!("{:.2} GiB", value / GIB)
+    }
+}
+
 fn network_security_requires_credentials(security: &str) -> bool {
     let normalized = security.trim().to_ascii_uppercase();
     !normalized.is_empty() && normalized != "OPEN" && normalized != "OWE"
@@ -4962,7 +5063,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        NotificationEntry, format_clock_pattern, menu_label, menu_matches_filter,
+        NotificationEntry, format_bytes, format_clock_pattern, menu_label, menu_matches_filter,
         network_security_is_enterprise, network_security_requires_credentials,
         notification_lifetime, parse_notification_history, parse_osd_payload,
         parse_weather_geocode,
@@ -5028,6 +5129,13 @@ mod tests {
         assert!(network_security_is_enterprise("WPA2-EAP"));
         assert!(network_security_is_enterprise("802.1X"));
         assert!(!network_security_is_enterprise("WPA2 WPA3"));
+    }
+
+    #[test]
+    fn formats_plugin_storage_sizes_for_human_readable_panels() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
     }
 
     #[test]
