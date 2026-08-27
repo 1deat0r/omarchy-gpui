@@ -8,12 +8,13 @@ use std::{
 };
 
 use gpui::{
-    AppContext, Bounds, ClickEvent, Context, Div, KeyDownEvent, ObjectFit, Render, Stateful,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
-    img, layer_shell::*, point, prelude::*, px, rgb, rgba, size,
+    AppContext, Bounds, ClickEvent, Context, Div, KeyDownEvent, ObjectFit, Render, ScrollDelta,
+    ScrollWheelEvent, Stateful, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, div, img, layer_shell::*, point, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::config::{BarEntry, ShellSnapshot};
+use crate::dbus::{TrayAction, TrayItem};
 use crate::ipc::{IpcEvent, IpcEventReceiver};
 use crate::menu::{DmenuOption, DmenuRequest, MenuItem, MenuItemKind, MenuModel};
 use crate::overlays::{
@@ -164,6 +165,7 @@ impl ShellView {
     }
 
     fn group(
+        snapshot: &ShellSnapshot,
         entries: &[BarEntry],
         clock: &str,
         system: &SystemSnapshot,
@@ -208,6 +210,42 @@ impl ShellView {
                                 run_action(&SystemAction::FocusWorkspace(workspace_name.clone()));
                         },
                     ));
+                }
+                continue;
+            }
+            if entry.id == "omarchy.tray" {
+                for item in &plugins.tray.items {
+                    if tray_item_owned_by_omarchy(item, snapshot) {
+                        continue;
+                    }
+                    let item = item.clone();
+                    let label = tray_item_label(&item);
+                    let id = format!("omarchy-tray-{}", sanitize_id(&item.id));
+                    let scroll_item = item.clone();
+                    group = group.child(
+                        Self::chip(&label, &id)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, event, _window, cx| {
+                                view.handle_tray_click(&item, event, cx);
+                            }))
+                            .on_scroll_wheel(cx.listener(
+                                move |_view, event: &ScrollWheelEvent, _window, _cx| {
+                                    let delta = match event.delta {
+                                        ScrollDelta::Pixels(value) => f32::from(value.y),
+                                        ScrollDelta::Lines(value) => value.y,
+                                    };
+                                    if delta != 0.0 {
+                                        let _ = crate::dbus::tray_action(
+                                            &scroll_item,
+                                            TrayAction::Scroll {
+                                                delta: delta.signum() as i32,
+                                                orientation: "vertical".to_string(),
+                                            },
+                                        );
+                                    }
+                                },
+                            )),
+                    );
                 }
                 continue;
             }
@@ -322,6 +360,23 @@ impl ShellView {
             _ if is_panel_capable(id) => self.toggle_panel(id, cx),
             _ => {}
         }
+    }
+
+    fn handle_tray_click(&mut self, item: &TrayItem, event: &ClickEvent, cx: &mut Context<Self>) {
+        let action = if event.is_right_click() {
+            TrayAction::ContextMenu
+        } else if event.is_middle_click() {
+            TrayAction::SecondaryActivate
+        } else if item.item_is_menu || !item.menu_path.is_empty() {
+            TrayAction::ContextMenu
+        } else {
+            TrayAction::Activate
+        };
+        let result = crate::dbus::tray_action(item, action);
+        if let Err(error) = result {
+            eprintln!("omarchy-gpui-shell: tray action: {error}");
+        }
+        cx.notify();
     }
 
     fn toggle_panel(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -507,8 +562,8 @@ impl Render for ShellView {
             .px_3()
             .bg(background)
             .text_color(rgb(0xf4f4f5))
-            .child(Self::chip("GPUI", "omarchy-gpui-status"))
             .child(Self::group(
+                &self.snapshot,
                 &self.snapshot.left,
                 &self.clock,
                 &self.system,
@@ -516,6 +571,7 @@ impl Render for ShellView {
                 cx,
             ))
             .child(div().flex_1().flex().justify_center().child(Self::group(
+                &self.snapshot,
                 &self.snapshot.center,
                 &self.clock,
                 &self.system,
@@ -523,6 +579,7 @@ impl Render for ShellView {
                 cx,
             )))
             .child(div().flex().justify_end().child(Self::group(
+                &self.snapshot,
                 &self.snapshot.right,
                 &self.clock,
                 &self.system,
@@ -2587,6 +2644,7 @@ fn indicator_bar_items(
 
 fn entry_visible(entry: &BarEntry, plugins: &PluginSnapshot, system: &SystemSnapshot) -> bool {
     match entry.id.as_str() {
+        "omarchy.tray" => !plugins.tray.items.is_empty(),
         "omarchy.keyboard-layout" => {
             plugins.keyboard.available && plugins.keyboard.multiple_layouts
         }
@@ -2607,6 +2665,58 @@ fn entry_visible(entry: &BarEntry, plugins: &PluginSnapshot, system: &SystemSnap
                 > 0.0
         }
         _ => true,
+    }
+}
+
+fn tray_item_owned_by_omarchy(item: &TrayItem, snapshot: &ShellSnapshot) -> bool {
+    let owned_name = format!(
+        "{} {} {}",
+        item.id.to_lowercase(),
+        item.title.to_lowercase(),
+        item.tooltip_title.to_lowercase()
+    );
+    if owned_name.contains("localsend") {
+        return true;
+    }
+    let dropbox_is_configured = snapshot
+        .left
+        .iter()
+        .chain(snapshot.center.iter())
+        .chain(snapshot.right.iter())
+        .any(|entry| entry.id == "omarchy.dropbox");
+    dropbox_is_configured && owned_name.contains("dropbox")
+}
+
+fn tray_item_label(item: &TrayItem) -> String {
+    let icon = if item.icon_name.is_empty() {
+        &item.overlay_icon_name
+    } else {
+        &item.icon_name
+    };
+    let icon = icon.split('?').next().unwrap_or_default();
+    let icon = icon.rsplit('/').next().unwrap_or(icon);
+    if icon.is_empty() {
+        "●".to_string()
+    } else {
+        format!("◈ {}", truncate(icon, 12))
+    }
+}
+
+fn sanitize_id(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "item".to_string()
+    } else {
+        sanitized
     }
 }
 

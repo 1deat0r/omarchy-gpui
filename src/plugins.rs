@@ -13,6 +13,8 @@ use std::{
 
 use serde_json::Value;
 
+use crate::dbus::{self, TraySnapshot};
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginSnapshot {
     pub agents: AgentState,
@@ -23,6 +25,7 @@ pub struct PluginSnapshot {
     pub indicators: IndicatorState,
     pub dropbox: DropboxState,
     pub tailscale: TailscaleState,
+    pub tray: TraySnapshot,
 }
 
 impl PluginSnapshot {
@@ -36,6 +39,13 @@ impl PluginSnapshot {
             indicators: IndicatorState::collect(),
             dropbox: DropboxState::collect_dropbox(omarchy_path),
             tailscale: TailscaleState::collect(),
+            tray: match dbus::tray_snapshot() {
+                Ok(tray) => tray,
+                Err(error) => TraySnapshot {
+                    error: Some(error),
+                    ..TraySnapshot::default()
+                },
+            },
         }
     }
 }
