@@ -994,6 +994,9 @@ struct PanelView {
     bluetooth_action_focused: bool,
     bluetooth_cursor_active: bool,
     bluetooth_discovery_active: bool,
+    monitor_focus_section: String,
+    monitor_selected_index: i32,
+    monitor_cursor_active: bool,
     speed_test: SpeedTestState,
     disk_speed_test: DiskSpeedTestState,
     gallery_selected_index: usize,
@@ -1192,6 +1195,16 @@ impl PanelView {
         } else {
             false
         };
+        let monitor_focus_section = if system.display.brightness_available {
+            "brightness"
+        } else {
+            "scale"
+        };
+        let monitor_selected_index = if monitor_focus_section == "brightness" {
+            -1
+        } else {
+            0
+        };
         let mut view = Self {
             id,
             omarchy_path: snapshot.omarchy_path,
@@ -1226,6 +1239,9 @@ impl PanelView {
             bluetooth_action_focused: false,
             bluetooth_cursor_active: false,
             bluetooth_discovery_active,
+            monitor_focus_section: monitor_focus_section.to_string(),
+            monitor_selected_index,
+            monitor_cursor_active: false,
             speed_test: SpeedTestState::default(),
             disk_speed_test: DiskSpeedTestState::default(),
             gallery_selected_index: 0,
@@ -3235,6 +3251,373 @@ impl PanelView {
             }))
     }
 
+    fn monitor_visible_sections(&self) -> Vec<&'static str> {
+        let mut sections = Vec::new();
+        if self.system.display.brightness_available {
+            sections.push("brightness");
+        }
+        sections.push("textsize");
+        sections.push("scale");
+        if self.system.display.displays.len() > 1 {
+            sections.push("monitors");
+        }
+        sections
+    }
+
+    fn monitor_section_count(&self, section: &str) -> usize {
+        match section {
+            "scale" => 6,
+            "monitors" => self.system.display.displays.len(),
+            _ => 0,
+        }
+    }
+
+    fn monitor_is_single_row(section: &str) -> bool {
+        matches!(section, "brightness" | "textsize" | "scale")
+    }
+
+    fn monitor_first_index(section: &str) -> i32 {
+        if matches!(section, "brightness" | "textsize") {
+            -1
+        } else {
+            0
+        }
+    }
+
+    fn move_monitor_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let sections = self.monitor_visible_sections();
+        if sections.is_empty() {
+            return;
+        }
+        let section_index = sections
+            .iter()
+            .position(|section| *section == self.monitor_focus_section);
+        let Some(section_index) = section_index else {
+            self.monitor_focus_section = sections[0].to_string();
+            self.monitor_selected_index = Self::monitor_first_index(sections[0]);
+            self.monitor_cursor_active = true;
+            cx.notify();
+            return;
+        };
+        let single_row = Self::monitor_is_single_row(&self.monitor_focus_section);
+        let max = if single_row {
+            Self::monitor_first_index(&self.monitor_focus_section)
+        } else {
+            self.monitor_section_count(&self.monitor_focus_section) as i32 - 1
+        };
+        if delta > 0 {
+            if !single_row && self.monitor_selected_index < max {
+                self.monitor_selected_index += 1;
+            } else if section_index + 1 < sections.len() {
+                let next = sections[section_index + 1];
+                self.monitor_focus_section = next.to_string();
+                self.monitor_selected_index = Self::monitor_first_index(next);
+            }
+        } else if !single_row && self.monitor_selected_index > 0 {
+            self.monitor_selected_index -= 1;
+        } else if section_index > 0 {
+            let previous = sections[section_index - 1];
+            self.monitor_focus_section = previous.to_string();
+            self.monitor_selected_index = if Self::monitor_is_single_row(previous) {
+                Self::monitor_first_index(previous)
+            } else {
+                self.monitor_section_count(previous) as i32 - 1
+            };
+        }
+        self.monitor_cursor_active = true;
+        cx.notify();
+    }
+
+    fn adjust_monitor_value(&mut self, delta: i32, cx: &mut Context<Self>) {
+        match self.monitor_focus_section.as_str() {
+            "brightness" if self.monitor_selected_index == -1 => {
+                let current = self.system.display.brightness_percent.unwrap_or(50);
+                let next = (i32::from(current) + delta * 5).clamp(1, 100) as u8;
+                let monitor = self.system.display.focused_monitor.clone();
+                if !monitor.is_empty() {
+                    self.execute_async(
+                        SystemAction::SetBrightness {
+                            monitor,
+                            percent: next,
+                        },
+                        "Updating brightness…",
+                        cx,
+                    );
+                }
+            }
+            "textsize" if self.monitor_selected_index == -1 => {
+                const STOPS: [u8; 7] = [9, 10, 11, 12, 14, 16, 20];
+                let current = self.system.display.text_size.unwrap_or(10);
+                let index = STOPS
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, value)| (i32::from(**value) - i32::from(current)).abs())
+                    .map(|(index, _)| index)
+                    .unwrap_or(1);
+                let next_index = (index as i32 + delta).clamp(0, STOPS.len() as i32 - 1) as usize;
+                self.execute_async(
+                    SystemAction::SetTextSize(STOPS[next_index]),
+                    "Updating text size…",
+                    cx,
+                );
+            }
+            "scale" => {
+                let next = (self.monitor_selected_index + delta).clamp(0, 5);
+                if next != self.monitor_selected_index {
+                    self.monitor_selected_index = next;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_monitor_cursor(&mut self, cx: &mut Context<Self>) {
+        match self.monitor_focus_section.as_str() {
+            "scale" => {
+                let scales = ["1", "1.25", "1.6", "2", "3", "4"];
+                if let Some(scale) = scales.get(self.monitor_selected_index as usize) {
+                    self.execute_async(
+                        SystemAction::SetMonitorScale((*scale).to_string()),
+                        "Applying monitor scale…",
+                        cx,
+                    );
+                }
+            }
+            "monitors" => {
+                if let Some(display) = self
+                    .system
+                    .display
+                    .displays
+                    .get(self.monitor_selected_index as usize)
+                {
+                    let enabled_count = self
+                        .system
+                        .display
+                        .displays
+                        .iter()
+                        .filter(|display| display.enabled)
+                        .count();
+                    if !display.enabled || enabled_count > 1 {
+                        self.execute_async(
+                            SystemAction::ToggleDisplay {
+                                name: display.name.clone(),
+                                enabled: !display.enabled,
+                            },
+                            if display.enabled {
+                                "Disabling display…"
+                            } else {
+                                "Enabling display…"
+                            },
+                            cx,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_monitor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => window.remove_window(),
+            "up" | "k" => self.move_monitor_cursor(-1, cx),
+            "down" | "j" => self.move_monitor_cursor(1, cx),
+            "left" | "h" => self.adjust_monitor_value(-1, cx),
+            "right" | "l" => self.adjust_monitor_value(1, cx),
+            "enter" | "return" | "space" => self.activate_monitor_cursor(cx),
+            _ => {}
+        }
+    }
+
+    fn monitor_slider_row(
+        &self,
+        section: &str,
+        label: &str,
+        detail: &str,
+        percent: Option<u8>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.monitor_cursor_active
+            && self.monitor_focus_section == section
+            && self.monitor_selected_index == -1;
+        let section_name = section.to_string();
+        div()
+            .id(format!("omarchy-gpui-monitor-{section}-slider"))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(label.to_string())
+                    .child(detail.to_string()),
+            )
+            .child(panel_meter(percent, false))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.monitor_focus_section = section_name.clone();
+                view.monitor_selected_index = -1;
+                view.monitor_cursor_active = true;
+                cx.notify();
+            }))
+    }
+
+    fn monitor_scale_button(
+        &self,
+        index: usize,
+        scale: &str,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.monitor_cursor_active
+            && self.monitor_focus_section == "scale"
+            && self.monitor_selected_index == index as i32;
+        let scale_value = scale.to_string();
+        div()
+            .id(format!("omarchy-gpui-monitor-scale-{index}"))
+            .cursor_pointer()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .bg(if active {
+                rgb(0x7c3aed)
+            } else if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else if active {
+                rgb(0xc4b5fd)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(scale.to_string())
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.monitor_focus_section = "scale".to_string();
+                view.monitor_selected_index = index as i32;
+                view.monitor_cursor_active = true;
+                view.execute_async(
+                    SystemAction::SetMonitorScale(scale_value.clone()),
+                    "Applying monitor scale…",
+                    cx,
+                );
+            }))
+    }
+
+    fn monitor_display_row(
+        &self,
+        index: usize,
+        display: &crate::system::DisplayInfo,
+        enabled_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.monitor_cursor_active
+            && self.monitor_focus_section == "monitors"
+            && self.monitor_selected_index == index as i32;
+        let name = display.name.clone();
+        let enabled = display.enabled;
+        let can_toggle = !enabled || enabled_count > 1;
+        let dimensions = if display.width > 0 && display.height > 0 {
+            format!("{}×{}", display.width, display.height)
+        } else {
+            "unknown size".to_string()
+        };
+        let detail = format!(
+            "{} · {}{}",
+            dimensions,
+            if enabled { "Enabled" } else { "Disabled" },
+            if display.focused { " · Focused" } else { "" },
+        );
+        div()
+            .id(format!("omarchy-gpui-monitor-display-{index}"))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected || display.focused {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(display.name.clone())
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xa1a1aa))
+                            .child(detail),
+                    ),
+            )
+            .child(if can_toggle {
+                if enabled { "DISABLE" } else { "ENABLE" }
+            } else {
+                "LOCKED"
+            })
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.monitor_focus_section = "monitors".to_string();
+                view.monitor_selected_index = index as i32;
+                view.monitor_cursor_active = true;
+                if can_toggle {
+                    view.execute_async(
+                        SystemAction::ToggleDisplay {
+                            name: name.clone(),
+                            enabled: !enabled,
+                        },
+                        if enabled {
+                            "Disabling display…"
+                        } else {
+                            "Enabling display…"
+                        },
+                        cx,
+                    );
+                } else {
+                    cx.notify();
+                }
+            }))
+    }
+
     fn handle_gallery_key(
         &mut self,
         event: &KeyDownEvent,
@@ -3306,6 +3689,10 @@ impl PanelView {
         }
         if self.id == "omarchy.bluetooth" {
             self.handle_bluetooth_key(event, window, cx);
+            return;
+        }
+        if self.id == "omarchy.monitor" {
+            self.handle_monitor_key(event, window, cx);
             return;
         }
         if self.id == "omarchy.dev-gallery" {
@@ -4776,132 +5163,34 @@ impl PanelView {
             "omarchy.monitor" => {
                 let focused_monitor = self.system.display.focused_monitor.clone();
                 content = content.child(panel_hero("Monitor", display_or_dash(&focused_monitor)));
-                content = content
-                    .child(panel_section_title("BRIGHTNESS"))
-                    .child(panel_meter(self.system.display.brightness_percent, false));
                 if self.system.display.brightness_available && !focused_monitor.is_empty() {
                     let current_brightness = self.system.display.brightness_percent.unwrap_or(50);
-                    let mut brightness = div().flex().gap_2();
-                    for percent in [
-                        current_brightness.saturating_sub(10),
-                        25,
-                        50,
-                        75,
-                        100,
-                        current_brightness.saturating_add(10).min(100),
-                    ] {
-                        brightness = brightness.child(self.network_choice_button(
-                            &format!("omarchy-gpui-monitor-brightness-{percent}"),
-                            &format!("{percent}%"),
-                            percent == current_brightness,
-                            SystemAction::SetBrightness {
-                                monitor: focused_monitor.clone(),
-                                percent,
-                            },
+                    content = content.child(panel_section_title("BRIGHTNESS")).child(
+                        self.monitor_slider_row(
+                            "brightness",
+                            "Brightness",
+                            &format!("{current_brightness}%"),
+                            Some(current_brightness),
                             cx,
-                        ));
-                    }
-                    content = content.child(brightness);
-                }
-                content = content.child(panel_section_title("DISPLAYS"));
-                let displays = self.system.display.displays.clone();
-                let enabled_display_count =
-                    displays.iter().filter(|display| display.enabled).count();
-                for display in &displays {
-                    let dimensions = if display.width > 0 && display.height > 0 {
-                        format!("{}×{}", display.width, display.height)
-                    } else {
-                        "unknown size".to_string()
-                    };
-                    let enabled = display.enabled;
-                    let can_toggle = !enabled || enabled_display_count > 1;
-                    let detail = format!(
-                        "{} · {}{}",
-                        dimensions,
-                        if enabled { "Enabled" } else { "Disabled" },
-                        if display.focused { " · Focused" } else { "" }
+                        ),
                     );
-                    let mut row = div()
-                        .id(format!(
-                            "omarchy-gpui-monitor-display-{}",
-                            sanitize_id(&display.name)
-                        ))
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(if display.focused {
-                            rgb(0x3f3f46)
-                        } else {
-                            rgb(0x27272a)
-                        })
-                        .border_1()
-                        .border_color(rgb(0x3f3f46))
-                        .child(panel_text_row(&display.name, &detail, display.focused));
-                    if can_toggle {
-                        let name = display.name.clone();
-                        row = row.child(
-                            div()
-                                .id(format!(
-                                    "omarchy-gpui-monitor-toggle-{}",
-                                    sanitize_id(&display.name)
-                                ))
-                                .cursor_pointer()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(0x3f3f46))
-                                .child(if enabled { "DISABLE" } else { "ENABLE" })
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.execute_async(
-                                        SystemAction::ToggleDisplay {
-                                            name: name.clone(),
-                                            enabled: !enabled,
-                                        },
-                                        if enabled {
-                                            "Disabling display…"
-                                        } else {
-                                            "Enabling display…"
-                                        },
-                                        cx,
-                                    );
-                                })),
-                        );
-                    }
-                    content = content.child(row);
                 }
-                content = content
-                    .child(panel_section_title("SCALING"))
-                    .child(panel_text_row(
-                        "Current scale",
-                        &display_or_dash(&self.system.display.monitor_scale),
-                        false,
-                    ));
-                let mut scales = div().flex().gap_2();
-                for (index, scale) in ["1", "1.25", "1.6", "2", "3", "4"].into_iter().enumerate() {
-                    scales = scales.child(self.network_choice_button(
-                        &format!("omarchy-gpui-monitor-scale-{index}"),
-                        scale,
-                        self.system.display.monitor_scale == scale,
-                        SystemAction::SetMonitorScale(scale.to_string()),
-                        cx,
-                    ));
-                }
-                content = content
-                    .child(panel_section_title("TEXT SIZE"))
-                    .child(panel_text_row(
-                        "Current",
+                content = content.child(panel_section_title("TEXT SIZE")).child(
+                    self.monitor_slider_row(
+                        "textsize",
+                        "Base text size",
                         &self
                             .system
                             .display
                             .text_size
                             .map_or_else(|| "—".to_string(), |value| format!("{value}px")),
-                        false,
-                    ));
-                let mut text_sizes = div().flex().gap_2();
+                        self.system.display.text_size.map(|value| {
+                            ((u16::from(value.saturating_sub(9)) * 100) / 11).min(100) as u8
+                        }),
+                        cx,
+                    ),
+                );
+                let mut text_sizes = div().flex().flex_wrap().gap_2();
                 for (index, size) in [9_u8, 10, 11, 12, 14, 16, 20].into_iter().enumerate() {
                     text_sizes = text_sizes.child(self.network_choice_button(
                         &format!("omarchy-gpui-monitor-text-size-{index}"),
@@ -4911,7 +5200,35 @@ impl PanelView {
                         cx,
                     ));
                 }
-                content = content.child(scales).child(text_sizes);
+                content = content
+                    .child(text_sizes)
+                    .child(panel_section_title("SCALE"));
+                let mut scales = div().flex().gap_2();
+                for (index, scale) in ["1", "1.25", "1.6", "2", "3", "4"].into_iter().enumerate() {
+                    scales = scales.child(self.monitor_scale_button(
+                        index,
+                        scale,
+                        self.system.display.monitor_scale == scale,
+                        cx,
+                    ));
+                }
+                content = content.child(scales);
+                let displays = self.system.display.displays.clone();
+                if displays.len() > 1 {
+                    content = content.child(panel_section_title("DISPLAYS"));
+                }
+                let enabled_display_count =
+                    displays.iter().filter(|display| display.enabled).count();
+                for (index, display) in displays.iter().enumerate() {
+                    if displays.len() > 1 {
+                        content = content.child(self.monitor_display_row(
+                            index,
+                            display,
+                            enabled_display_count,
+                            cx,
+                        ));
+                    }
+                }
                 Some(content)
             }
             "omarchy.network" => {
