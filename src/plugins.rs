@@ -51,22 +51,52 @@ impl PluginSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentState {
     pub default_agent: String,
     pub available: bool,
+    pub providers: Vec<AgentProviderState>,
     pub error: Option<String>,
 }
 
 impl AgentState {
     fn collect(omarchy_path: &Path) -> Self {
-        match omarchy_command(omarchy_path, "omarchy-default-agent", &[]) {
+        let mut state = match omarchy_command(omarchy_path, "omarchy-default-agent", &[]) {
             Ok(raw) => parse_default_agent(&raw),
             Err(error) => Self {
                 error: Some(error),
                 ..Self::default()
             },
+        };
+        let usage_dir = agent_usage_dir();
+        let mut providers = Vec::new();
+        match fs::read_dir(&usage_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Ok(raw) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    if let Ok(provider) = parse_agent_usage_record(&raw) {
+                        providers.push(provider);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                state.error = Some(format!("read {}: {error}", usage_dir.display()));
+            }
         }
+        providers.sort_by(|left, right| left.id.cmp(&right.id));
+        if !providers.is_empty() {
+            state.available = true;
+            state.error = None;
+        }
+        state.providers = providers;
+        state
     }
 }
 
@@ -76,7 +106,215 @@ pub fn parse_default_agent(raw: &str) -> AgentState {
         available: !default_agent.is_empty(),
         default_agent,
         error: None,
+        providers: Vec::new(),
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentProviderState {
+    pub id: String,
+    pub name: String,
+    pub ready: bool,
+    pub status_text: String,
+    pub auth_help_text: String,
+    pub tier_label: String,
+    pub limits: Vec<AgentLimitState>,
+    pub recent_days: Vec<AgentUsageDay>,
+    pub models: Vec<AgentModelState>,
+    pub today_prompts: u64,
+    pub today_sessions: u64,
+    pub today_tokens: u64,
+    pub total_prompts: u64,
+    pub total_sessions: u64,
+    pub active_days: u64,
+    pub balance: Option<AgentBalanceState>,
+    pub scope: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentLimitState {
+    pub label: String,
+    pub title: String,
+    pub percent: f64,
+    pub resets_at: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentUsageDay {
+    pub date: String,
+    pub message_count: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentModelState {
+    pub id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+impl AgentModelState {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_tokens)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentBalanceState {
+    pub remaining: f64,
+    pub funded: f64,
+    pub spent: f64,
+    pub currency: String,
+    pub estimated: bool,
+}
+
+pub fn parse_agent_usage_record(raw: &str) -> Result<AgentProviderState, String> {
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("agent usage record is invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "agent usage record is not an object".to_string())?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err("agent usage record has no provider id".to_string());
+    }
+    let mut limits = object
+        .get("limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|limit| {
+            let percent = limit.get("percent").and_then(Value::as_f64)?;
+            Some(AgentLimitState {
+                label: value_string(limit.get("label")),
+                title: value_string(limit.get("title")),
+                percent: percent.clamp(0.0, 1.0),
+                resets_at: value_string(limit.get("resetsAt")),
+            })
+        })
+        .collect::<Vec<_>>();
+    limits.sort_by(|left, right| {
+        right
+            .percent
+            .partial_cmp(&left.percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let recent_days = object
+        .get("recentDays")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|day| AgentUsageDay {
+            date: value_string(day.get("date")),
+            message_count: value_u64(day.get("messageCount")),
+        })
+        .filter(|day| !day.date.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut models = object
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(id, model)| AgentModelState {
+            id: id.clone(),
+            input_tokens: value_u64(model.get("inputTokens")),
+            output_tokens: value_u64(model.get("outputTokens")),
+            cache_read_tokens: value_u64(model.get("cacheReadInputTokens")),
+            cache_creation_tokens: value_u64(model.get("cacheCreationInputTokens")),
+        })
+        .collect::<Vec<_>>();
+    models.sort_by_key(|model| std::cmp::Reverse(model.total_tokens()));
+    models.truncate(4);
+
+    let balance = object.get("balance").and_then(|balance| {
+        let remaining = balance.get("remaining").and_then(Value::as_f64)?;
+        Some(AgentBalanceState {
+            remaining: remaining.max(0.0),
+            funded: balance
+                .get("funded")
+                .and_then(Value::as_f64)
+                .unwrap_or_default()
+                .max(0.0),
+            spent: balance
+                .get("spent")
+                .and_then(Value::as_f64)
+                .unwrap_or_default()
+                .max(0.0),
+            currency: value_string(balance.get("currency")),
+            estimated: balance
+                .get("estimated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    });
+
+    Ok(AgentProviderState {
+        id,
+        name: value_string(object.get("name")),
+        ready: object
+            .get("ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        status_text: value_string(object.get("usageStatusText")),
+        auth_help_text: value_string(object.get("authHelpText")),
+        tier_label: value_string(object.get("tierLabel")),
+        limits,
+        recent_days,
+        models,
+        today_prompts: value_u64(object.get("todayPrompts")),
+        today_sessions: value_u64(object.get("todaySessions")),
+        today_tokens: value_u64(object.get("todayTotalTokens")),
+        total_prompts: value_u64(object.get("totalPrompts")),
+        total_sessions: value_u64(object.get("totalSessions")),
+        active_days: value_u64(object.get("activeDays")),
+        balance,
+        scope: value_string(object.get("scope")),
+        error: None,
+    })
+}
+
+fn agent_usage_dir() -> PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    state_home.join("omarchy/agents/usage")
+}
+
+fn value_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.trim().to_string(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn value_u64(value: Option<&Value>) -> u64 {
+    value
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_f64().map(|value| value.max(0.0) as u64))
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -920,9 +1158,9 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_default_agent, parse_dictation_state, parse_dropbox_status, parse_keyboard_devices,
-        parse_network_qr, parse_reminder_indicator, parse_tailscale_status, parse_update_status,
-        parse_weather_report, parse_weather_status,
+        parse_agent_usage_record, parse_default_agent, parse_dictation_state, parse_dropbox_status,
+        parse_keyboard_devices, parse_network_qr, parse_reminder_indicator, parse_tailscale_status,
+        parse_update_status, parse_weather_report, parse_weather_status,
     };
 
     #[test]
@@ -934,6 +1172,35 @@ mod tests {
         let weather = parse_weather_status("Auckland  ·  Temp 12°C  ·  Wind ←4km/h");
         assert!(weather.available);
         assert_eq!(weather.location, "Auckland");
+    }
+
+    #[test]
+    fn parses_agent_usage_limits_history_and_models() {
+        let provider = parse_agent_usage_record(
+            r#"{
+                "id":"codex",
+                "name":"Codex",
+                "ready":true,
+                "usageStatusText":"Ready",
+                "tierLabel":"Pro",
+                "limits":[{"label":"Weekly","percent":0.42,"resetsAt":"2099-01-01T00:00:00Z"}],
+                "recentDays":[{"date":"2098-12-31","messageCount":12}],
+                "modelUsage":{"gpt-5":{"inputTokens":100,"outputTokens":50,"cacheReadInputTokens":25}},
+                "todayPrompts":4,
+                "todaySessions":2,
+                "todayTotalTokens":175,
+                "totalPrompts":10,
+                "totalSessions":3,
+                "activeDays":2
+            }"#,
+        )
+        .expect("agent usage fixture should parse");
+        assert_eq!(provider.id, "codex");
+        assert_eq!(provider.limits[0].title, "");
+        assert_eq!(provider.limits[0].percent, 0.42);
+        assert_eq!(provider.recent_days[0].message_count, 12);
+        assert_eq!(provider.models[0].total_tokens(), 175);
+        assert_eq!(provider.today_tokens, 175);
     }
 
     #[test]

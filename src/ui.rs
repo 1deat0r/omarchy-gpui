@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -986,6 +986,8 @@ struct PanelView {
     weather_selected_suggestion: usize,
     network_editor: Option<NetworkEditor>,
     network_selected_index: usize,
+    speed_test: SpeedTestState,
+    disk_speed_test: DiskSpeedTestState,
     calendar_year: i32,
     calendar_month: u8,
     calendar_today: (i32, u8, u8),
@@ -1034,6 +1036,26 @@ struct NetworkEditor {
     identity: String,
     passphrase: String,
     field: NetworkEditorField,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SpeedTestState {
+    running: bool,
+    phase: String,
+    connection: String,
+    download_mbps: Option<u32>,
+    upload_mbps: Option<u32>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DiskSpeedTestState {
+    running: bool,
+    disk: String,
+    phase: String,
+    read_mbps: Option<u32>,
+    write_mbps: Option<u32>,
+    error: Option<String>,
 }
 
 impl PanelView {
@@ -1146,7 +1168,9 @@ impl PanelView {
                 .ok()
                 .and_then(|value| value.get("edit").and_then(serde_json::Value::as_bool))
                 .unwrap_or(false);
-        Self {
+        let start_speed_test = id == "omarchy.speedtest";
+        let start_disk_speed_test = id == "omarchy.disk-speedtest";
+        let mut view = Self {
             id,
             omarchy_path: snapshot.omarchy_path,
             system,
@@ -1172,10 +1196,18 @@ impl PanelView {
             weather_selected_suggestion: 0,
             network_editor: None,
             network_selected_index: 0,
+            speed_test: SpeedTestState::default(),
+            disk_speed_test: DiskSpeedTestState::default(),
             calendar_year: calendar_today.0,
             calendar_month: calendar_today.1,
             calendar_today,
+        };
+        if start_speed_test {
+            view.start_speed_test(cx);
+        } else if start_disk_speed_test {
+            view.start_disk_speed_test(cx);
         }
+        view
     }
 
     fn execute(&mut self, action: SystemAction, cx: &mut Context<Self>) {
@@ -1575,7 +1607,8 @@ impl PanelView {
                         "omarchy-agent-usage-update",
                         &["--force"],
                         cx,
-                    ));
+                    ))
+                    .child(self.ipc_button("Next provider", &["agents", "next"], cx));
             }
             "omarchy.dropbox" => {
                 if self.plugins.dropbox.installed {
@@ -1621,27 +1654,20 @@ impl PanelView {
                     .child(self.ipc_button("Dismiss all", &["notifications", "dismissAll"], cx));
             }
             "omarchy.disk-speedtest" => {
-                actions = actions.child(self.command_button(
+                actions = actions.child(self.measurement_button(
                     "Run disk test",
-                    "omarchy-disk-speedtest",
-                    &[],
+                    true,
+                    self.disk_speed_test.running,
                     cx,
                 ));
             }
             "omarchy.speedtest" => {
-                actions = actions
-                    .child(self.command_button(
-                        "Download test",
-                        "omarchy-network-speedtest",
-                        &["down"],
-                        cx,
-                    ))
-                    .child(self.command_button(
-                        "Upload test",
-                        "omarchy-network-speedtest",
-                        &["up"],
-                        cx,
-                    ));
+                actions = actions.child(self.measurement_button(
+                    "Run speed test",
+                    false,
+                    self.speed_test.running,
+                    cx,
+                ));
             }
             "omarchy.weather" => {
                 actions = actions
@@ -2244,6 +2270,141 @@ impl PanelView {
             });
         })
         .detach();
+    }
+
+    fn start_speed_test(&mut self, cx: &mut Context<Self>) {
+        if self.speed_test.running {
+            return;
+        }
+        let connection = if self.system.network.connection.is_empty()
+            || self.system.network.connection == "--"
+        {
+            "Network".to_string()
+        } else {
+            self.system.network.connection.clone()
+        };
+        let program = self.omarchy_program("omarchy-network-speedtest");
+        self.speed_test = SpeedTestState {
+            running: true,
+            phase: "down".to_string(),
+            connection,
+            ..SpeedTestState::default()
+        };
+        self.message = "Measuring download and upload…".to_string();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { run_speed_test(&program) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.speed_test = match result {
+                    Ok((download_mbps, upload_mbps)) => SpeedTestState {
+                        running: false,
+                        phase: String::new(),
+                        connection: view.speed_test.connection.clone(),
+                        download_mbps: Some(download_mbps),
+                        upload_mbps: Some(upload_mbps),
+                        error: None,
+                    },
+                    Err(error) => SpeedTestState {
+                        running: false,
+                        phase: String::new(),
+                        connection: view.speed_test.connection.clone(),
+                        error: Some(error),
+                        ..SpeedTestState::default()
+                    },
+                };
+                view.message = if view.speed_test.error.is_some() {
+                    "Speed test failed".to_string()
+                } else {
+                    "Speed test complete".to_string()
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_disk_speed_test(&mut self, cx: &mut Context<Self>) {
+        if self.disk_speed_test.running {
+            return;
+        }
+        let program = self.omarchy_program("omarchy-disk-speedtest");
+        self.disk_speed_test = DiskSpeedTestState {
+            running: true,
+            phase: "read".to_string(),
+            ..DiskSpeedTestState::default()
+        };
+        self.message = "Measuring disk read and write speed…".to_string();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { run_disk_speed_test(&program) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.disk_speed_test = match result {
+                    Ok((disk, read_mbps, write_mbps)) => DiskSpeedTestState {
+                        running: false,
+                        disk,
+                        phase: String::new(),
+                        read_mbps: Some(read_mbps),
+                        write_mbps: Some(write_mbps),
+                        error: None,
+                    },
+                    Err(error) => DiskSpeedTestState {
+                        running: false,
+                        phase: String::new(),
+                        error: Some(error),
+                        ..DiskSpeedTestState::default()
+                    },
+                };
+                view.message = if view.disk_speed_test.error.is_some() {
+                    "Disk speed test failed".to_string()
+                } else {
+                    "Disk speed test complete".to_string()
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn measurement_button(
+        &self,
+        label: &str,
+        disk: bool,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let id = format!(
+            "omarchy-gpui-measurement-{}",
+            label.to_lowercase().replace(' ', "-")
+        );
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x27272a))
+            .border_1()
+            .border_color(rgb(0x3f3f46))
+            .child(if running {
+                "Running…".to_string()
+            } else {
+                label.to_string()
+            })
+            .when(!running, |button| {
+                button.on_click(cx.listener(move |view, _, _, cx| {
+                    if disk {
+                        view.start_disk_speed_test(cx);
+                    } else {
+                        view.start_speed_test(cx);
+                    }
+                }))
+            })
     }
 
     fn open_network_editor(&mut self, network: &WifiNetwork, cx: &mut Context<Self>) {
@@ -3331,6 +3492,138 @@ impl PanelView {
         let mut content = div().flex().flex_col().gap_3().mt_3();
         match self.id.as_str() {
             "omarchy.clock" => Some(self.clock_calendar_content(cx)),
+            "omarchy.agents" => {
+                let agents = &self.plugins.agents;
+                let default_agent = if agents.default_agent.is_empty() {
+                    "No default agent".to_string()
+                } else {
+                    agents.default_agent.clone()
+                };
+                content = content.child(panel_hero("Agents", default_agent));
+                if let Some(error) = &agents.error {
+                    content = content.child(panel_empty_row(&format!("Error: {error}")));
+                }
+                if agents.providers.is_empty() {
+                    content = content.child(panel_empty_row(
+                        "No usage records found. Use an agent once to populate this panel.",
+                    ));
+                } else {
+                    for provider in &agents.providers {
+                        let provider_name = if provider.name.is_empty() {
+                            provider.id.clone()
+                        } else {
+                            provider.name.clone()
+                        };
+                        let provider_status = if provider.status_text.is_empty() {
+                            if provider.tier_label.is_empty() {
+                                "Ready".to_string()
+                            } else {
+                                provider.tier_label.clone()
+                            }
+                        } else {
+                            provider.status_text.clone()
+                        };
+                        content = content
+                            .child(panel_section_title(&provider_name.to_uppercase()))
+                            .child(panel_hero(&provider_name, provider_status));
+                        if !provider.auth_help_text.is_empty() {
+                            content = content.child(panel_empty_row(&provider.auth_help_text));
+                        }
+                        content = content
+                            .child(panel_text_row(
+                                "Today",
+                                &format!(
+                                    "{} prompts · {} sessions · {} tokens",
+                                    provider.today_prompts,
+                                    provider.today_sessions,
+                                    format_token_count(provider.today_tokens),
+                                ),
+                                false,
+                            ))
+                            .child(panel_text_row(
+                                "All time",
+                                &format!(
+                                    "{} prompts · {} sessions · {} active days",
+                                    provider.total_prompts,
+                                    provider.total_sessions,
+                                    provider.active_days,
+                                ),
+                                false,
+                            ));
+                        if let Some(balance) = &provider.balance {
+                            let currency = if balance.currency.is_empty() {
+                                "USD"
+                            } else {
+                                balance.currency.as_str()
+                            };
+                            content = content.child(panel_section_title("BALANCE")).child(
+                                panel_text_row(
+                                    "Remaining",
+                                    &format!("{currency} {:.2}", balance.remaining),
+                                    balance.funded > 0.0
+                                        && balance.remaining / balance.funded <= 0.1,
+                                ),
+                            );
+                            if balance.funded > 0.0 {
+                                let ratio =
+                                    (balance.remaining / balance.funded).clamp(0.0, 1.0) * 100.0;
+                                content = content
+                                    .child(panel_meter(Some(ratio.round() as u8), ratio <= 10.0));
+                            }
+                        }
+                        if !provider.limits.is_empty() {
+                            content = content.child(panel_section_title("LIMITS"));
+                            for limit in &provider.limits {
+                                let title = if limit.title.is_empty() {
+                                    if limit.label.is_empty() {
+                                        "Limit"
+                                    } else {
+                                        limit.label.as_str()
+                                    }
+                                } else {
+                                    limit.title.as_str()
+                                };
+                                let percent = (limit.percent.clamp(0.0, 1.0) * 100.0).round() as u8;
+                                content = content
+                                    .child(panel_text_row(
+                                        title,
+                                        &format!(
+                                            "{percent}%{}",
+                                            if limit.resets_at.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" · resets {}", limit.resets_at)
+                                            }
+                                        ),
+                                        percent >= 90,
+                                    ))
+                                    .child(panel_meter(Some(percent), percent >= 90));
+                            }
+                        }
+                        if !provider.recent_days.is_empty() {
+                            content = content.child(panel_section_title("TOKENS BY DAY"));
+                            for day in &provider.recent_days {
+                                content = content.child(panel_text_row(
+                                    &day.date,
+                                    &format_token_count(day.message_count),
+                                    false,
+                                ));
+                            }
+                        }
+                        if !provider.models.is_empty() {
+                            content = content.child(panel_section_title("TOKENS BY MODEL"));
+                            for model in &provider.models {
+                                content = content.child(panel_text_row(
+                                    &friendly_model_name(&model.id),
+                                    &format_token_count(model.total_tokens()),
+                                    false,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Some(content)
+            }
             "omarchy.weather" => {
                 let weather = &self.plugins.weather;
                 let temperature = if weather.temp_c.is_empty() {
@@ -3951,6 +4244,90 @@ impl PanelView {
                     ));
                 }
                 if let Some(error) = &tailscale.error {
+                    content = content.child(panel_empty_row(&format!("Error: {error}")));
+                }
+                Some(content)
+            }
+            "omarchy.speedtest" => {
+                let state = &self.speed_test;
+                let connection = if state.connection.is_empty() {
+                    "Network".to_string()
+                } else {
+                    state.connection.clone()
+                };
+                let phase = if state.running {
+                    if state.phase.is_empty() {
+                        "Running".to_string()
+                    } else {
+                        format!("Running {}", state.phase)
+                    }
+                } else if state.error.is_some() {
+                    "Failed".to_string()
+                } else if state.download_mbps.is_some() {
+                    "Complete".to_string()
+                } else {
+                    "Ready".to_string()
+                };
+                content = content
+                    .child(panel_hero("Internet speed", connection))
+                    .child(panel_text_row(
+                        "Download",
+                        &state
+                            .download_mbps
+                            .map_or_else(|| "—".to_string(), |value| format!("{value} Mbps")),
+                        state.phase == "down",
+                    ))
+                    .child(panel_text_row(
+                        "Upload",
+                        &state
+                            .upload_mbps
+                            .map_or_else(|| "—".to_string(), |value| format!("{value} Mbps")),
+                        state.phase == "up",
+                    ))
+                    .child(panel_text_row("State", &phase, state.running));
+                if let Some(error) = &state.error {
+                    content = content.child(panel_empty_row(&format!("Error: {error}")));
+                }
+                Some(content)
+            }
+            "omarchy.disk-speedtest" => {
+                let state = &self.disk_speed_test;
+                let disk = if state.disk.is_empty() {
+                    "Disk".to_string()
+                } else {
+                    state.disk.clone()
+                };
+                let phase = if state.running {
+                    if state.phase.is_empty() {
+                        "Running".to_string()
+                    } else {
+                        format!("Running {}", state.phase)
+                    }
+                } else if state.error.is_some() {
+                    "Failed".to_string()
+                } else if state.read_mbps.is_some() {
+                    "Complete".to_string()
+                } else {
+                    "Ready".to_string()
+                };
+                content = content
+                    .child(panel_hero("Disk speed", disk))
+                    .child(panel_text_row(
+                        "Read",
+                        &state
+                            .read_mbps
+                            .map_or_else(|| "—".to_string(), |value| format!("{value} MB/s")),
+                        state.phase == "read",
+                    ))
+                    .child(panel_text_row(
+                        "Write",
+                        &state
+                            .write_mbps
+                            .map_or_else(|| "—".to_string(), |value| format!("{value} MB/s")),
+                        state.phase == "write",
+                    ))
+                    .child(panel_text_row("State", &phase, state.running));
+                if let Some(error) = &state.error {
                     content = content.child(panel_empty_row(&format!("Error: {error}")));
                 }
                 Some(content)
@@ -4825,6 +5202,104 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000_000 {
+        format!("{:.1}B", tokens as f64 / 1_000_000_000.0)
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn friendly_model_name(id: &str) -> String {
+    if id.is_empty() {
+        return "Unknown".to_string();
+    }
+    id.split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part.eq_ignore_ascii_case("gpt") {
+                "GPT".to_string()
+            } else if part.eq_ignore_ascii_case("deepseek") {
+                "DeepSeek".to_string()
+            } else {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_speed_test(program: &Path) -> Result<(u32, u32), String> {
+    let download = run_timed_command(program, &["down"], 6)?;
+    let upload = run_timed_command(program, &["up"], 6)?;
+    let download = last_numeric_line(&download)
+        .ok_or_else(|| "download test produced no measurement".to_string())?;
+    let upload = last_numeric_line(&upload)
+        .ok_or_else(|| "upload test produced no measurement".to_string())?;
+    Ok((download, upload))
+}
+
+fn run_disk_speed_test(program: &Path) -> Result<(String, u32, u32), String> {
+    let output = run_timed_command(program, &[], 20)?;
+    let mut disk = String::new();
+    let mut read = None;
+    let mut write = None;
+    for line in output.lines().map(str::trim) {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("disk") => disk = parts.collect::<Vec<_>>().join(" "),
+            Some("read") => read = parts.next().and_then(parse_rate_value),
+            Some("write") => write = parts.next().and_then(parse_rate_value),
+            _ => {}
+        }
+    }
+    let read = read.ok_or_else(|| "disk test produced no read measurement".to_string())?;
+    let write = write.ok_or_else(|| "disk test produced no write measurement".to_string())?;
+    Ok((disk, read, write))
+}
+
+fn run_timed_command(program: &Path, args: &[&str], seconds: u64) -> Result<String, String> {
+    let duration = format!("{seconds}s");
+    let output = Command::new("timeout")
+        .args(["--signal=TERM", duration.as_str()])
+        .arg(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{}: {error}", program.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let timed_out = matches!(output.status.code(), Some(124) | Some(143));
+    if !output.status.success() && !timed_out {
+        return Err(if stderr.is_empty() {
+            format!("{} exited with {}", program.display(), output.status)
+        } else {
+            format!("{}: {stderr}", program.display())
+        });
+    }
+    if stdout.trim().is_empty() && !stderr.is_empty() {
+        return Err(format!("{}: {stderr}", program.display()));
+    }
+    Ok(stdout)
+}
+
+fn last_numeric_line(raw: &str) -> Option<u32> {
+    raw.lines()
+        .rev()
+        .find_map(|line| parse_rate_value(line.trim()))
+}
+
+fn parse_rate_value(raw: &str) -> Option<u32> {
+    let value = raw.parse::<f64>().ok()?;
+    value.is_finite().then_some(value.max(0.0).round() as u32)
+}
+
 fn network_security_requires_credentials(security: &str) -> bool {
     let normalized = security.trim().to_ascii_uppercase();
     !normalized.is_empty() && normalized != "OPEN" && normalized != "OWE"
@@ -5260,9 +5735,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        NotificationEntry, format_bytes, format_clock_pattern, menu_label, menu_matches_filter,
-        network_security_is_enterprise, network_security_requires_credentials,
-        notification_lifetime, parse_notification_history, parse_osd_payload,
+        NotificationEntry, format_bytes, format_clock_pattern, last_numeric_line, menu_label,
+        menu_matches_filter, network_security_is_enterprise, network_security_requires_credentials,
+        notification_lifetime, parse_notification_history, parse_osd_payload, parse_rate_value,
         parse_weather_geocode,
     };
     use crate::menu::{MenuItem, MenuItemKind};
@@ -5333,6 +5808,14 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1.0 KiB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn parses_measurement_streams_without_treating_labels_as_rates() {
+        assert_eq!(last_numeric_line("98\n101\n"), Some(101));
+        assert_eq!(last_numeric_line("disk Samsung\nread 2048\n"), None);
+        assert_eq!(parse_rate_value("12.6"), Some(13));
+        assert_eq!(parse_rate_value("not-a-rate"), None);
     }
 
     #[test]
