@@ -687,11 +687,60 @@ fn dispatch_call(
         | ("omarchy.indicators", "refresh")
         | ("omarchy.system-update", "refresh" | "clear")
         | ("omarchy.menu", "refresh")
-        | ("omarchy.clock", "refresh" | "cycleFormat" | "toggleWeekStart")
+        | ("omarchy.clock", "refresh")
         | ("omarchy.dropbox", "refresh")
         | ("omarchy.tailscale", "refresh")
         | ("omarchy.weather", "refresh")
         | ("omarchy.nightlight", "refresh") => Ok(outcome("ok", Some(IpcEvent::Refresh))),
+
+        ("omarchy.clock", "cycleFormat") => {
+            let vertical = matches!(runtime.snapshot.bar_position.as_str(), "left" | "right");
+            let key = if vertical { "verticalFormat" } else { "format" };
+            let default = if vertical {
+                "HH\n—\nmm"
+            } else {
+                "dddd HH:mm"
+            };
+            let alternate_key = if vertical {
+                "verticalFormatAlt"
+            } else {
+                "formatAlt"
+            };
+            let (current, alternate) =
+                clock_settings(&runtime.snapshot, key, alternate_key, default);
+            let next = next_clock_format(vertical, &current, &alternate);
+            let error = runtime.snapshot.set_bar_widget(
+                "omarchy.clock",
+                key,
+                serde_json::Value::String(next),
+                None,
+            )?;
+            if error.is_empty() {
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
+            } else {
+                Ok(outcome(&error, None))
+            }
+        }
+        ("omarchy.clock", "toggleWeekStart") => {
+            let current = clock_setting(&runtime.snapshot, "weekStartDay")
+                .unwrap_or_else(|| "monday".to_string());
+            let next = if current.eq_ignore_ascii_case("monday") {
+                "sunday"
+            } else {
+                "monday"
+            };
+            let error = runtime.snapshot.set_bar_widget(
+                "omarchy.clock",
+                "weekStartDay",
+                serde_json::Value::String(next.to_string()),
+                None,
+            )?;
+            if error.is_empty() {
+                Ok(outcome("ok", Some(IpcEvent::Refresh)))
+            } else {
+                Ok(outcome(&error, None))
+            }
+        }
 
         ("omarchy.dropbox", "login") => {
             if command_present("dropbox-cli") {
@@ -1386,6 +1435,65 @@ fn snapshot_widget_bool(snapshot: &ShellSnapshot, id: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn clock_setting(snapshot: &ShellSnapshot, key: &str) -> Option<String> {
+    snapshot
+        .left
+        .iter()
+        .chain(snapshot.center.iter())
+        .chain(snapshot.right.iter())
+        .find(|entry| entry.id == "omarchy.clock")
+        .and_then(|entry| entry.settings.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn clock_settings(
+    snapshot: &ShellSnapshot,
+    key: &str,
+    alternate_key: &str,
+    default: &str,
+) -> (String, String) {
+    (
+        clock_setting(snapshot, key).unwrap_or_else(|| default.to_string()),
+        clock_setting(snapshot, alternate_key).unwrap_or_default(),
+    )
+}
+
+fn next_clock_format(vertical: bool, current: &str, alternate: &str) -> String {
+    let presets = if vertical {
+        [
+            "HH\n—\nmm",
+            "h\n—\nmm\nAP",
+            "dd\nMMM\n'W'ww\n''yy",
+            "HH\nmm",
+        ]
+        .as_slice()
+    } else {
+        [
+            "dddd HH:mm",
+            "dddd h:mm AP",
+            "HH:mm",
+            "h:mm AP",
+            "ddd d MMM HH:mm",
+            "ddd d MMM h:mm AP",
+            "d MMMM 'W'ww yyyy",
+            "yyyy-MM-dd HH:mm",
+        ]
+        .as_slice()
+    };
+    let mut ring = Vec::new();
+    for candidate in presets.iter().copied().chain([alternate, current]) {
+        if !candidate.is_empty() && !ring.iter().any(|value| *value == candidate) {
+            ring.push(candidate);
+        }
+    }
+    if ring.is_empty() {
+        return current.to_string();
+    }
+    let index = ring.iter().position(|value| *value == current).unwrap_or(0);
+    ring[(index + 1) % ring.len()].to_string()
+}
+
 fn media_action(action: SystemAction) -> Result<CommandOutcome, String> {
     Ok(outcome(
         if run_action(&action).is_ok() {
@@ -2034,8 +2142,8 @@ mod tests {
 
     use super::{
         IpcEvent, IpcRuntime, ShellCommand, clear_live_notifications, clear_notification_history,
-        dismiss_notifications_matching, dispatch_runtime, load_dnd_state, parse, parse_exec_argv,
-        persist_dnd_state, read_notification_history,
+        dismiss_notifications_matching, dispatch_runtime, load_dnd_state, next_clock_format, parse,
+        parse_exec_argv, persist_dnd_state, read_notification_history,
     };
     use crate::config::ShellSnapshot;
 
@@ -2118,6 +2226,19 @@ mod tests {
     #[test]
     fn rejects_unknown_methods() {
         assert!(parse(&args(&["shell", "nope"])).is_err());
+    }
+
+    #[test]
+    fn clock_format_cycle_matches_reference_ring() {
+        assert_eq!(
+            next_clock_format(false, "dddd HH:mm", "d MMMM 'W'ww yyyy"),
+            "dddd h:mm AP"
+        );
+        assert_eq!(
+            next_clock_format(false, "yyyy-MM-dd HH:mm", "d MMMM 'W'ww yyyy"),
+            "dddd HH:mm"
+        );
+        assert_eq!(next_clock_format(true, "HH\n—\nmm", ""), "h\n—\nmm\nAP");
     }
 
     #[test]

@@ -256,7 +256,13 @@ impl ShellView {
             if !entry_visible(entry, plugins, system) {
                 continue;
             }
-            let label = label_for_entry(entry, clock, system, plugins);
+            let label = label_for_entry(
+                entry,
+                clock,
+                matches!(snapshot.bar_position.as_str(), "left" | "right"),
+                system,
+                plugins,
+            );
             let _settings_are_preserved = &entry.settings;
             let id = entry.id.clone();
             if id == "omarchy.media" {
@@ -3068,11 +3074,12 @@ fn sanitize_id(value: &str) -> String {
 fn label_for_entry(
     entry: &BarEntry,
     clock: &str,
+    vertical: bool,
     system: &SystemSnapshot,
     plugins: &PluginSnapshot,
 ) -> String {
     match entry.id.as_str() {
-        "omarchy.clock" => clock.to_string(),
+        "omarchy.clock" => clock_label(&entry.settings, clock, vertical),
         "omarchy.workspaces" => {
             if system.hyprland.active_workspace.is_empty() {
                 "WORKSPACES".to_string()
@@ -3222,8 +3229,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        NotificationEntry, menu_label, menu_matches_filter, notification_lifetime,
-        parse_notification_history, parse_osd_payload,
+        NotificationEntry, format_clock_pattern, menu_label, menu_matches_filter,
+        notification_lifetime, parse_notification_history, parse_osd_payload,
     };
     use crate::menu::{MenuItem, MenuItemKind};
 
@@ -3282,6 +3289,24 @@ mod tests {
         };
         assert_eq!(notification_lifetime(&long), Some(Duration::from_secs(20)));
     }
+
+    #[test]
+    fn clock_format_matches_reference_tokens_and_iso_week() {
+        let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+        local.tm_year = 126;
+        local.tm_mon = 0;
+        local.tm_mday = 1;
+        local.tm_wday = 4;
+        local.tm_yday = 0;
+        local.tm_hour = 15;
+        local.tm_min = 7;
+        let formatted =
+            format_clock_pattern("dddd HH:mm · h:mm AP · d MMMM 'W'ww yyyy · ''yy", &local);
+        assert_eq!(
+            formatted,
+            "Thursday 15:07 · 3:07 PM · 1 January W01 2026 · '26"
+        );
+    }
 }
 
 fn local_clock() -> String {
@@ -3296,10 +3321,202 @@ fn local_clock() -> String {
         let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
         if !result.is_null() {
             let local = unsafe { local.assume_init() };
-            return format!("{:02}:{:02}", local.tm_hour, local.tm_min);
+            return format_clock_pattern("HH:mm", &local);
         }
     }
 
     let minutes = (seconds / 60) % (24 * 60);
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn clock_label(settings: &serde_json::Value, fallback: &str, vertical: bool) -> String {
+    let key = if vertical { "verticalFormat" } else { "format" };
+    let default = if vertical {
+        "HH\n—\nmm"
+    } else {
+        "dddd HH:mm"
+    };
+    settings
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(local_clock_with_pattern)
+        .unwrap_or_else(|| {
+            if settings.get(key).is_some() {
+                fallback.to_string()
+            } else {
+                local_clock_with_pattern(default)
+            }
+        })
+}
+
+fn local_clock_with_pattern(pattern: &str) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+
+    #[cfg(unix)]
+    {
+        let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+        if !result.is_null() {
+            let local = unsafe { local.assume_init() };
+            return format_clock_pattern(pattern, &local);
+        }
+    }
+
+    pattern.to_string()
+}
+
+fn format_clock_pattern(pattern: &str, local: &libc::tm) -> String {
+    let weekday = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    let weekday_short = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let month = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let month_short = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let weekday_index = usize::try_from(local.tm_wday).unwrap_or(0).min(6);
+    let month_index = usize::try_from(local.tm_mon).unwrap_or(0).min(11);
+    let hour24 = local.tm_hour.clamp(0, 23);
+    let hour12 = match hour24 % 12 {
+        0 => 12,
+        value => value,
+    };
+    let day = local.tm_mday.clamp(1, 31);
+    let year = local.tm_year + 1900;
+    let iso_week = iso_week_number(local);
+    let mut output = String::new();
+    let chars = pattern.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\'' {
+            if chars.get(index + 1) == Some(&'\'') {
+                output.push('\'');
+                index += 2;
+                continue;
+            }
+            index += 1;
+            while index < chars.len() && chars[index] != '\'' {
+                output.push(chars[index]);
+                index += 1;
+            }
+            if index < chars.len() {
+                index += 1;
+            }
+            continue;
+        }
+        let remaining = &chars[index..];
+        let (token, value) = if remaining.starts_with(&['d', 'd', 'd', 'd']) {
+            ("dddd", weekday[weekday_index].to_string())
+        } else if remaining.starts_with(&['d', 'd', 'd']) {
+            ("ddd", weekday_short[weekday_index].to_string())
+        } else if remaining.starts_with(&['M', 'M', 'M', 'M']) {
+            ("MMMM", month[month_index].to_string())
+        } else if remaining.starts_with(&['M', 'M', 'M']) {
+            ("MMM", month_short[month_index].to_string())
+        } else if remaining.starts_with(&['y', 'y', 'y', 'y']) {
+            ("yyyy", format!("{year:04}"))
+        } else if remaining.starts_with(&['y', 'y']) {
+            ("yy", format!("{:02}", year.rem_euclid(100)))
+        } else if remaining.starts_with(&['H', 'H']) {
+            ("HH", format!("{hour24:02}"))
+        } else if remaining.starts_with(&['m', 'm']) {
+            ("mm", format!("{:02}", local.tm_min.clamp(0, 59)))
+        } else if remaining.starts_with(&['s', 's']) {
+            ("ss", format!("{:02}", local.tm_sec.clamp(0, 60)))
+        } else if remaining.starts_with(&['A', 'P']) {
+            (
+                "AP",
+                if hour24 < 12 {
+                    "AM".to_string()
+                } else {
+                    "PM".to_string()
+                },
+            )
+        } else if remaining.starts_with(&['w', 'w']) {
+            ("ww", format!("{iso_week:02}"))
+        } else if remaining.starts_with(&['d', 'd']) {
+            ("dd", format!("{day:02}"))
+        } else if remaining[0] == 'd' {
+            ("d", day.to_string())
+        } else if remaining[0] == 'h' {
+            ("h", hour12.to_string())
+        } else if remaining[0] == 'H' {
+            ("H", hour24.to_string())
+        } else if remaining[0] == 'M' {
+            ("M", (local.tm_mon + 1).to_string())
+        } else {
+            output.push(remaining[0]);
+            index += 1;
+            continue;
+        };
+        output.push_str(&value);
+        index += token.chars().count();
+    }
+    output
+}
+
+fn iso_week_number(local: &libc::tm) -> i32 {
+    let weekday = if local.tm_wday == 0 { 7 } else { local.tm_wday };
+    let ordinal = local.tm_yday + 1;
+    let mut week = (ordinal - weekday + 10) / 7;
+    if week < 1 {
+        week = iso_weeks_in_year(local.tm_year + 1899);
+    } else if week > iso_weeks_in_year(local.tm_year + 1900) {
+        week = 1;
+    }
+    week
+}
+
+fn iso_weeks_in_year(year: i32) -> i32 {
+    let jan1 = weekday_sunday(year, 1, 1);
+    if jan1 == 4 || (jan1 == 3 && is_leap_year(year)) {
+        53
+    } else {
+        52
+    }
+}
+
+fn weekday_sunday(year: i32, month: i32, day: i32) -> i32 {
+    let (year, month) = if month <= 2 {
+        (year - 1, month + 12)
+    } else {
+        (year, month)
+    };
+    let century_year = year.rem_euclid(100);
+    let century = year.div_euclid(100);
+    let zeller = (day
+        + (13 * (month + 1)) / 5
+        + century_year
+        + century_year / 4
+        + century / 4
+        + 5 * century)
+        % 7;
+    (zeller + 6) % 7
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
