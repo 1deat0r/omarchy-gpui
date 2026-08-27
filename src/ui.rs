@@ -3585,43 +3585,126 @@ impl PanelView {
                 Some(content)
             }
             "omarchy.monitor" => {
-                content = content.child(panel_hero(
-                    "Monitor",
-                    display_or_dash(&self.system.display.focused_monitor),
-                ));
+                let focused_monitor = self.system.display.focused_monitor.clone();
+                content = content.child(panel_hero("Monitor", display_or_dash(&focused_monitor)));
                 content = content
                     .child(panel_section_title("BRIGHTNESS"))
                     .child(panel_meter(self.system.display.brightness_percent, false));
+                if self.system.display.brightness_available && !focused_monitor.is_empty() {
+                    let current_brightness = self.system.display.brightness_percent.unwrap_or(50);
+                    let mut brightness = div().flex().gap_2();
+                    for percent in [
+                        current_brightness.saturating_sub(10),
+                        25,
+                        50,
+                        75,
+                        100,
+                        current_brightness.saturating_add(10).min(100),
+                    ] {
+                        brightness = brightness.child(self.network_choice_button(
+                            &format!("omarchy-gpui-monitor-brightness-{percent}"),
+                            &format!("{percent}%"),
+                            percent == current_brightness,
+                            SystemAction::SetBrightness {
+                                monitor: focused_monitor.clone(),
+                                percent,
+                            },
+                            cx,
+                        ));
+                    }
+                    content = content.child(brightness);
+                }
                 content = content.child(panel_section_title("DISPLAYS"));
-                for display in &self.system.display.displays {
+                let displays = self.system.display.displays.clone();
+                let enabled_display_count =
+                    displays.iter().filter(|display| display.enabled).count();
+                for display in &displays {
                     let dimensions = if display.width > 0 && display.height > 0 {
                         format!("{}×{}", display.width, display.height)
                     } else {
                         "unknown size".to_string()
                     };
-                    content = content.child(panel_text_row(
-                        &display.name,
-                        &format!(
-                            "{} · {}",
-                            dimensions,
-                            if display.enabled {
-                                "Enabled"
-                            } else {
-                                "Disabled"
-                            }
-                        ),
-                        display.focused,
-                    ));
+                    let enabled = display.enabled;
+                    let can_toggle = !enabled || enabled_display_count > 1;
+                    let detail = format!(
+                        "{} · {}{}",
+                        dimensions,
+                        if enabled { "Enabled" } else { "Disabled" },
+                        if display.focused { " · Focused" } else { "" }
+                    );
+                    let mut row = div()
+                        .id(format!(
+                            "omarchy-gpui-monitor-display-{}",
+                            sanitize_id(&display.name)
+                        ))
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(if display.focused {
+                            rgb(0x3f3f46)
+                        } else {
+                            rgb(0x27272a)
+                        })
+                        .border_1()
+                        .border_color(rgb(0x3f3f46))
+                        .child(panel_text_row(&display.name, &detail, display.focused));
+                    if can_toggle {
+                        let name = display.name.clone();
+                        row = row.child(
+                            div()
+                                .id(format!(
+                                    "omarchy-gpui-monitor-toggle-{}",
+                                    sanitize_id(&display.name)
+                                ))
+                                .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x3f3f46))
+                                .child(if enabled { "DISABLE" } else { "ENABLE" })
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.execute_async(
+                                        SystemAction::ToggleDisplay {
+                                            name: name.clone(),
+                                            enabled: !enabled,
+                                        },
+                                        if enabled {
+                                            "Disabling display…"
+                                        } else {
+                                            "Enabling display…"
+                                        },
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+                    content = content.child(row);
                 }
                 content = content
                     .child(panel_section_title("SCALING"))
                     .child(panel_text_row(
-                        "Scale",
+                        "Current scale",
                         &display_or_dash(&self.system.display.monitor_scale),
                         false,
-                    ))
+                    ));
+                let mut scales = div().flex().gap_2();
+                for (index, scale) in ["1", "1.25", "1.6", "2", "3", "4"].into_iter().enumerate() {
+                    scales = scales.child(self.network_choice_button(
+                        &format!("omarchy-gpui-monitor-scale-{index}"),
+                        scale,
+                        self.system.display.monitor_scale == scale,
+                        SystemAction::SetMonitorScale(scale.to_string()),
+                        cx,
+                    ));
+                }
+                content = content
+                    .child(panel_section_title("TEXT SIZE"))
                     .child(panel_text_row(
-                        "Text size",
+                        "Current",
                         &self
                             .system
                             .display
@@ -3629,6 +3712,17 @@ impl PanelView {
                             .map_or_else(|| "—".to_string(), |value| format!("{value}px")),
                         false,
                     ));
+                let mut text_sizes = div().flex().gap_2();
+                for (index, size) in [9_u8, 10, 11, 12, 14, 16, 20].into_iter().enumerate() {
+                    text_sizes = text_sizes.child(self.network_choice_button(
+                        &format!("omarchy-gpui-monitor-text-size-{index}"),
+                        &format!("{size}px"),
+                        self.system.display.text_size == Some(size),
+                        SystemAction::SetTextSize(size),
+                        cx,
+                    ));
+                }
+                content = content.child(scales).child(text_sizes);
                 Some(content)
             }
             "omarchy.network" => {
