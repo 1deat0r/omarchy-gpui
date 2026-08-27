@@ -1151,7 +1151,7 @@ impl PanelView {
     }
 
     fn actions(&self, cx: &mut Context<Self>) -> Div {
-        let mut actions = div().flex().gap_2().mt_4();
+        let mut actions = div().flex().flex_wrap().gap_2().mt_4();
         match self.id.as_str() {
             "omarchy.audio" => {
                 actions = actions
@@ -2381,6 +2381,286 @@ impl PanelView {
                     }),
             )
     }
+
+    fn rich_panel_content(&self) -> Option<Div> {
+        let mut content = div().flex().flex_col().gap_3().mt_3();
+        match self.id.as_str() {
+            "omarchy.audio" => {
+                content = content.child(panel_hero(
+                    "Audio",
+                    self.system.audio.output_percent.map_or_else(
+                        || "Output unavailable".to_string(),
+                        |value| format!("{value}%"),
+                    ),
+                ));
+                content = content
+                    .child(panel_section_title("OUTPUT"))
+                    .child(panel_meter(
+                        self.system.audio.output_percent,
+                        self.system.audio.output_muted,
+                    ));
+                for node in &self.system.audio.sinks {
+                    content = content.child(panel_node_row(
+                        &node.description,
+                        node.volume,
+                        node.is_default,
+                        node.muted,
+                    ));
+                }
+                if !self.system.audio.sources.is_empty() {
+                    content = content.child(panel_section_title("INPUT"));
+                    for node in &self.system.audio.sources {
+                        content = content.child(panel_node_row(
+                            &node.description,
+                            node.volume,
+                            node.is_default,
+                            node.muted,
+                        ));
+                    }
+                }
+                if !self.system.audio.streams.is_empty() {
+                    content = content.child(panel_section_title("STREAMS"));
+                    for node in &self.system.audio.streams {
+                        let label = if node.application.is_empty() {
+                            &node.description
+                        } else {
+                            &node.application
+                        };
+                        content =
+                            content.child(panel_node_row(label, node.volume, false, node.muted));
+                    }
+                }
+                Some(content)
+            }
+            "omarchy.bluetooth" => {
+                content = content.child(panel_hero(
+                    "Bluetooth",
+                    if self.system.bluetooth.powered {
+                        format!("{} connected", self.system.bluetooth.connected_devices)
+                    } else {
+                        "Powered off".to_string()
+                    },
+                ));
+                content = content.child(panel_section_title("DEVICES"));
+                if self.system.bluetooth.devices.is_empty() {
+                    content = content.child(panel_empty_row("No discovered devices"));
+                } else {
+                    for device in &self.system.bluetooth.devices {
+                        content = content.child(panel_text_row(
+                            &device.name,
+                            if device.connected {
+                                "Connected"
+                            } else {
+                                "Available"
+                            },
+                            device.connected,
+                        ));
+                    }
+                }
+                Some(content)
+            }
+            "omarchy.monitor" => {
+                content = content.child(panel_hero(
+                    "Monitor",
+                    display_or_dash(&self.system.display.focused_monitor),
+                ));
+                content = content
+                    .child(panel_section_title("BRIGHTNESS"))
+                    .child(panel_meter(self.system.display.brightness_percent, false));
+                content = content.child(panel_section_title("DISPLAYS"));
+                for display in &self.system.display.displays {
+                    let dimensions = if display.width > 0 && display.height > 0 {
+                        format!("{}×{}", display.width, display.height)
+                    } else {
+                        "unknown size".to_string()
+                    };
+                    content = content.child(panel_text_row(
+                        &display.name,
+                        &format!(
+                            "{} · {}",
+                            dimensions,
+                            if display.enabled {
+                                "Enabled"
+                            } else {
+                                "Disabled"
+                            }
+                        ),
+                        display.focused,
+                    ));
+                }
+                content = content
+                    .child(panel_section_title("SCALING"))
+                    .child(panel_text_row(
+                        "Scale",
+                        &display_or_dash(&self.system.display.monitor_scale),
+                        false,
+                    ))
+                    .child(panel_text_row(
+                        "Text size",
+                        &self
+                            .system
+                            .display
+                            .text_size
+                            .map_or_else(|| "—".to_string(), |value| format!("{value}px")),
+                        false,
+                    ));
+                Some(content)
+            }
+            "omarchy.network" => {
+                let connection = if self.system.network.connection.is_empty()
+                    || self.system.network.connection == "--"
+                {
+                    "Disconnected".to_string()
+                } else {
+                    self.system.network.connection.clone()
+                };
+                content = content.child(panel_hero("Network", connection));
+                content = content
+                    .child(panel_section_title("SIGNAL"))
+                    .child(panel_meter(
+                        self.system.network.signal_percent,
+                        self.system.network.wifi_enabled == Some(false),
+                    ))
+                    .child(panel_section_title("CONNECTION"));
+                for (label, value) in [
+                    (
+                        "Interface",
+                        display_or_dash(&self.system.network.details.iface),
+                    ),
+                    ("Address", display_or_dash(&self.system.network.details.ip)),
+                    (
+                        "Gateway",
+                        display_or_dash(&self.system.network.details.gateway),
+                    ),
+                    (
+                        "Router ping",
+                        display_or_dash(&self.system.network.details.router_ping_ms),
+                    ),
+                    (
+                        "Internet ping",
+                        display_or_dash(&self.system.network.details.internet_ping_ms),
+                    ),
+                ] {
+                    content = content.child(panel_text_row(label, &value, false));
+                }
+                if !self.system.network.wifi_networks.is_empty() {
+                    content = content.child(panel_section_title("WI-FI NETWORKS"));
+                    for network in &self.system.network.wifi_networks {
+                        if network.ssid.is_empty() {
+                            continue;
+                        }
+                        let detail = format!(
+                            "{}% · {}{}",
+                            network.signal_percent.max(0),
+                            display_or_dash(&network.security),
+                            if network.connected {
+                                " · Connected"
+                            } else {
+                                ""
+                            }
+                        );
+                        content = content.child(panel_text_row(
+                            &network.ssid,
+                            &detail,
+                            network.connected,
+                        ));
+                    }
+                }
+                if !self.system.network.band.available.is_empty() {
+                    content = content
+                        .child(panel_section_title("WI-FI BAND"))
+                        .child(panel_text_row(
+                            "Selected",
+                            &display_or_dash(&self.system.network.band.selected),
+                            false,
+                        ))
+                        .child(panel_text_row(
+                            "Current",
+                            &display_or_dash(&self.system.network.band.current),
+                            false,
+                        ));
+                }
+                Some(content)
+            }
+            "omarchy.power" => {
+                let battery = self.system.battery.percentage.map_or_else(
+                    || "Battery unavailable".to_string(),
+                    |value| format!("{value}%"),
+                );
+                content = content
+                    .child(panel_hero("Power", battery))
+                    .child(panel_meter(self.system.battery.percentage, false))
+                    .child(panel_section_title("BATTERY"));
+                for (label, value) in [
+                    ("State", display_or_dash(&self.system.battery.state)),
+                    ("Rate", display_or_dash(&self.system.battery.rate)),
+                    ("Time", display_or_dash(&self.system.battery.time_remaining)),
+                    ("Size", display_or_dash(&self.system.battery.size)),
+                    ("Cycles", display_or_dash(&self.system.battery.cycles)),
+                    ("Threshold", display_or_dash(&self.system.battery.threshold)),
+                ] {
+                    content = content.child(panel_text_row(label, &value, false));
+                }
+                if !self.system.power.profiles.is_empty() {
+                    content = content.child(panel_section_title("POWER PROFILE"));
+                    for profile in &self.system.power.profiles {
+                        content = content.child(panel_text_row(
+                            &profile.name,
+                            if profile.active {
+                                "Active"
+                            } else {
+                                "Available"
+                            },
+                            profile.active,
+                        ));
+                    }
+                }
+                Some(content)
+            }
+            "omarchy.media" => {
+                let title = if self.system.media.title.is_empty() {
+                    "No active track".to_string()
+                } else {
+                    self.system.media.title.clone()
+                };
+                let artist = if self.system.media.artist.is_empty() {
+                    display_or_dash(&self.system.media.player)
+                } else {
+                    self.system.media.artist.clone()
+                };
+                content = content
+                    .child(panel_hero("Media", title))
+                    .child(panel_text_row("Artist", &artist, false))
+                    .child(panel_text_row(
+                        "Status",
+                        &display_or_dash(&self.system.media.status),
+                        self.system.media.status.eq_ignore_ascii_case("playing"),
+                    ));
+                if !self.system.media.players.is_empty() {
+                    content = content.child(panel_section_title("PLAYERS"));
+                    for player in &self.system.media.players {
+                        let label = if player.player.is_empty() {
+                            &player.desktop_entry
+                        } else {
+                            &player.player
+                        };
+                        let detail = if player.title.is_empty() {
+                            display_or_dash(&player.status)
+                        } else {
+                            format!("{} · {}", player.status, truncate(&player.title, 28))
+                        };
+                        content = content.child(panel_text_row(
+                            label,
+                            &detail,
+                            player.status.eq_ignore_ascii_case("playing"),
+                        ));
+                    }
+                }
+                Some(content)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Render for PanelView {
@@ -2414,6 +2694,8 @@ impl Render for PanelView {
             self.osd_content()
         } else if self.is_overlay() {
             self.overlay_content(cx)
+        } else if let Some(content) = self.rich_panel_content() {
+            content
         } else {
             let mut rows = div().flex().flex_col().gap_2().mt_3();
             for (label, value) in panel_rows(&self.id, &self.system, &self.plugins) {
@@ -3027,6 +3309,111 @@ fn panel_rows(
         ],
         _ => vec![("State".to_string(), "GPUI adapter active".to_string())],
     }
+}
+
+fn panel_hero(title: &str, detail: String) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .p_3()
+        .rounded_md()
+        .bg(rgb(0x27272a))
+        .border_1()
+        .border_color(rgb(0x52525b))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_size(px(17.0)).child(title.to_string()))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0xa1a1aa))
+                        .child(detail),
+                ),
+        )
+}
+
+fn panel_section_title(title: &str) -> Div {
+    div()
+        .mt_1()
+        .text_size(px(11.0))
+        .text_color(rgb(0xa1a1aa))
+        .child(title.to_string())
+}
+
+fn panel_meter(percent: Option<u8>, muted: bool) -> Div {
+    let value = percent.unwrap_or_default().min(100);
+    let fill_width = 7.2 * f32::from(value);
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_size(px(11.0))
+                .text_color(rgb(0xa1a1aa))
+                .child(if muted {
+                    "Muted".to_string()
+                } else if percent.is_some() {
+                    format!("{value}%")
+                } else {
+                    "Unavailable".to_string()
+                }),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(7.0))
+                .rounded_md()
+                .bg(rgb(0x3f3f46))
+                .child(
+                    div()
+                        .h(px(7.0))
+                        .rounded_md()
+                        .bg(if muted { rgb(0x71717a) } else { rgb(0xa78bfa) })
+                        .w(px(fill_width)),
+                ),
+        )
+}
+
+fn panel_node_row(label: &str, volume: Option<u8>, is_default: bool, muted: bool) -> Div {
+    let detail = format!(
+        "{}{}{}",
+        volume.map_or_else(|| "—".to_string(), |value| format!("{value}%")),
+        if muted { " · Muted" } else { "" },
+        if is_default { " · Default" } else { "" }
+    );
+    panel_text_row(label, &detail, is_default)
+}
+
+fn panel_text_row(label: &str, detail: &str, highlighted: bool) -> Div {
+    div()
+        .flex()
+        .justify_between()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(if highlighted {
+            rgb(0x3f3f46)
+        } else {
+            rgb(0x27272a)
+        })
+        .child(div().text_color(rgb(0xf4f4f5)).child(truncate(label, 44)))
+        .child(div().text_color(rgb(0xa1a1aa)).child(truncate(detail, 44)))
+}
+
+fn panel_empty_row(label: &str) -> Div {
+    div()
+        .px_3()
+        .py_2()
+        .text_color(rgb(0xa1a1aa))
+        .child(label.to_string())
 }
 
 fn display_or_dash(value: &str) -> String {
