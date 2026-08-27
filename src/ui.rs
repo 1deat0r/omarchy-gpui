@@ -986,6 +986,9 @@ struct PanelView {
     weather_selected_suggestion: usize,
     network_editor: Option<NetworkEditor>,
     network_selected_index: usize,
+    audio_focus_section: String,
+    audio_selected_index: i32,
+    audio_cursor_active: bool,
     speed_test: SpeedTestState,
     disk_speed_test: DiskSpeedTestState,
     gallery_selected_index: usize,
@@ -1202,6 +1205,9 @@ impl PanelView {
             weather_selected_suggestion: 0,
             network_editor: None,
             network_selected_index: 0,
+            audio_focus_section: "output".to_string(),
+            audio_selected_index: -1,
+            audio_cursor_active: false,
             speed_test: SpeedTestState::default(),
             disk_speed_test: DiskSpeedTestState::default(),
             gallery_selected_index: 0,
@@ -2623,6 +2629,428 @@ impl PanelView {
         }
     }
 
+    fn audio_visible_sections(&self) -> Vec<&'static str> {
+        let mut sections = vec!["output"];
+        if !self.system.audio.sources.is_empty() || self.system.audio.input_percent.is_some() {
+            sections.push("input");
+        }
+        if !self.system.audio.streams.is_empty() {
+            sections.push("streams");
+        }
+        sections
+    }
+
+    fn audio_section_count(&self, section: &str) -> usize {
+        match section {
+            "output" => self.system.audio.sinks.len(),
+            "input" => self.system.audio.sources.len(),
+            "streams" => self.system.audio.streams.len(),
+            _ => 0,
+        }
+    }
+
+    fn audio_section_has_slider(section: &str) -> bool {
+        matches!(section, "output" | "input")
+    }
+
+    fn move_audio_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let sections = self.audio_visible_sections();
+        if sections.is_empty() {
+            return;
+        }
+        if self.audio_focus_section == "header" {
+            if delta > 0 {
+                self.audio_focus_section = sections[0].to_string();
+                self.audio_selected_index = -1;
+                self.audio_cursor_active = true;
+                cx.notify();
+            }
+            return;
+        }
+        let section_index = sections
+            .iter()
+            .position(|section| *section == self.audio_focus_section);
+        let Some(section_index) = section_index else {
+            self.audio_focus_section = sections[0].to_string();
+            self.audio_selected_index = -1;
+            self.audio_cursor_active = true;
+            cx.notify();
+            return;
+        };
+
+        let count = self.audio_section_count(&self.audio_focus_section) as i32;
+        let floor = if Self::audio_section_has_slider(&self.audio_focus_section) {
+            -1
+        } else {
+            0
+        };
+        let max = count - 1;
+        if delta > 0 {
+            if self.audio_selected_index < max {
+                self.audio_selected_index += 1;
+            } else if section_index + 1 < sections.len() {
+                let next = sections[section_index + 1];
+                self.audio_focus_section = next.to_string();
+                self.audio_selected_index = if Self::audio_section_has_slider(next) {
+                    -1
+                } else {
+                    0
+                };
+            }
+        } else if self.audio_selected_index > floor {
+            self.audio_selected_index -= 1;
+        } else if section_index > 0 {
+            let previous = sections[section_index - 1];
+            self.audio_focus_section = previous.to_string();
+            let previous_max = self.audio_section_count(previous) as i32 - 1;
+            self.audio_selected_index =
+                previous_max.max(if Self::audio_section_has_slider(previous) {
+                    -1
+                } else {
+                    0
+                });
+        } else {
+            self.audio_focus_section = "header".to_string();
+            self.audio_selected_index = -1;
+        }
+        self.audio_cursor_active = true;
+        cx.notify();
+    }
+
+    fn adjust_audio_volume(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let current = match self.audio_focus_section.as_str() {
+            "output" if self.audio_selected_index == -1 => {
+                self.system.audio.output_percent.unwrap_or(50)
+            }
+            "input" if self.audio_selected_index == -1 => {
+                self.system.audio.input_percent.unwrap_or(50)
+            }
+            "streams" if self.audio_selected_index >= 0 => self
+                .system
+                .audio
+                .streams
+                .get(self.audio_selected_index as usize)
+                .and_then(|node| node.volume)
+                .unwrap_or(50),
+            _ => return,
+        };
+        let next = (i32::from(current) + delta * 5).clamp(0, 100) as u8;
+        let action = match self.audio_focus_section.as_str() {
+            "output" => SystemAction::SetOutputVolume(next),
+            "input" => {
+                let Some(node) = self
+                    .system
+                    .audio
+                    .sources
+                    .iter()
+                    .find(|node| node.is_default)
+                    .or_else(|| self.system.audio.sources.first())
+                else {
+                    return;
+                };
+                SystemAction::SetAudioNodeVolume {
+                    id: node.id,
+                    percent: next,
+                }
+            }
+            "streams" => {
+                let Some(node) = self
+                    .system
+                    .audio
+                    .streams
+                    .get(self.audio_selected_index as usize)
+                else {
+                    return;
+                };
+                SystemAction::SetAudioNodeVolume {
+                    id: node.id,
+                    percent: next,
+                }
+            }
+            _ => return,
+        };
+        self.execute_async(action, "Updating audio volume…", cx);
+    }
+
+    fn activate_audio_cursor(&mut self, cx: &mut Context<Self>) {
+        match self.audio_focus_section.as_str() {
+            "header" => {
+                self.execute_async(SystemAction::ToggleOutputMute, "Toggling audio mute…", cx);
+                if !self.system.audio.sources.is_empty() {
+                    self.execute_async(SystemAction::ToggleInputMute, "Toggling input mute…", cx);
+                }
+            }
+            "output" if self.audio_selected_index == -1 => {
+                self.execute_async(SystemAction::ToggleOutputMute, "Toggling output mute…", cx);
+            }
+            "output" => {
+                if let Some(node) = self
+                    .system
+                    .audio
+                    .sinks
+                    .get(self.audio_selected_index as usize)
+                {
+                    self.execute_async(
+                        SystemAction::SetDefaultAudioSink {
+                            id: node.id,
+                            name: node.name.clone(),
+                        },
+                        "Selecting audio output…",
+                        cx,
+                    );
+                }
+            }
+            "input" if self.audio_selected_index == -1 => {
+                self.execute_async(SystemAction::ToggleInputMute, "Toggling input mute…", cx);
+            }
+            "input" => {
+                if let Some(node) = self
+                    .system
+                    .audio
+                    .sources
+                    .get(self.audio_selected_index as usize)
+                {
+                    self.execute_async(
+                        SystemAction::SetDefaultAudioSource {
+                            id: node.id,
+                            name: node.name.clone(),
+                        },
+                        "Selecting audio input…",
+                        cx,
+                    );
+                }
+            }
+            "streams" => {
+                if let Some(node) = self
+                    .system
+                    .audio
+                    .streams
+                    .get(self.audio_selected_index as usize)
+                {
+                    self.execute_async(
+                        SystemAction::ToggleAudioNodeMute { id: node.id },
+                        "Toggling stream mute…",
+                        cx,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_audio_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => window.remove_window(),
+            "up" | "k" => self.move_audio_cursor(-1, cx),
+            "down" | "j" => self.move_audio_cursor(1, cx),
+            "left" | "h" => {
+                self.adjust_audio_volume(-1, cx);
+                self.audio_cursor_active = true;
+            }
+            "right" | "l" => {
+                self.adjust_audio_volume(1, cx);
+                self.audio_cursor_active = true;
+            }
+            "enter" | "return" | "space" => self.activate_audio_cursor(cx),
+            "m" | "M" => {
+                if self.audio_focus_section == "streams" && self.audio_selected_index >= 0 {
+                    if let Some(node) = self
+                        .system
+                        .audio
+                        .streams
+                        .get(self.audio_selected_index as usize)
+                    {
+                        self.execute_async(
+                            SystemAction::ToggleAudioNodeMute { id: node.id },
+                            "Toggling stream mute…",
+                            cx,
+                        );
+                    }
+                } else if self.audio_focus_section == "input" {
+                    self.execute_async(SystemAction::ToggleInputMute, "Toggling input mute…", cx);
+                } else {
+                    self.execute_async(SystemAction::ToggleOutputMute, "Toggling output mute…", cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn audio_slider_row(
+        &self,
+        section: &str,
+        label: &str,
+        percent: Option<u8>,
+        muted: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.audio_cursor_active
+            && self.audio_focus_section == section
+            && self.audio_selected_index == -1;
+        let section_name = section.to_string();
+        div()
+            .id(format!("omarchy-gpui-audio-{section}-slider"))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(label.to_string())
+                    .child(percent.map_or_else(|| "—".to_string(), |value| format!("{value}%"))),
+            )
+            .child(panel_meter(percent, muted))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.audio_focus_section = section_name.clone();
+                view.audio_selected_index = -1;
+                view.audio_cursor_active = true;
+                cx.notify();
+            }))
+    }
+
+    fn audio_node_row(
+        &self,
+        section: &str,
+        index: usize,
+        node: &crate::system::AudioNode,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let selected = self.audio_cursor_active
+            && self.audio_focus_section == section
+            && self.audio_selected_index == index as i32;
+        let section_name = section.to_string();
+        let action = match section {
+            "output" => Some(SystemAction::SetDefaultAudioSink {
+                id: node.id,
+                name: node.name.clone(),
+            }),
+            "input" => Some(SystemAction::SetDefaultAudioSource {
+                id: node.id,
+                name: node.name.clone(),
+            }),
+            "streams" => Some(SystemAction::ToggleAudioNodeMute { id: node.id }),
+            _ => None,
+        };
+        let pending = match section {
+            "output" => "Selecting audio output…",
+            "input" => "Selecting audio input…",
+            "streams" => "Toggling stream mute…",
+            _ => "Updating audio…",
+        };
+        let label = if section == "streams" && !node.application.is_empty() {
+            node.application.clone()
+        } else if node.description.is_empty() {
+            node.name.clone()
+        } else {
+            node.description.clone()
+        };
+        let detail = format!(
+            "{}{}{}",
+            node.volume
+                .map_or_else(|| "—".to_string(), |value| format!("{value}%")),
+            if node.muted { " · Muted" } else { "" },
+            if node.is_default { " · Default" } else { "" },
+        );
+        div()
+            .id(format!("omarchy-gpui-audio-{section}-{index}"))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected || node.is_default {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_3()
+                    .child(div().text_color(rgb(0xf4f4f5)).child(truncate(&label, 44)))
+                    .child(div().text_color(rgb(0xa1a1aa)).child(detail)),
+            )
+            .child(panel_meter(node.volume, node.muted))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.audio_focus_section = section_name.clone();
+                view.audio_selected_index = index as i32;
+                view.audio_cursor_active = true;
+                if let Some(action) = action.clone() {
+                    view.execute_async(action, pending, cx);
+                } else {
+                    cx.notify();
+                }
+            }))
+    }
+
+    fn audio_header_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let selected = self.audio_cursor_active && self.audio_focus_section == "header";
+        let any_audible = !self.system.audio.output_muted || !self.system.audio.input_muted;
+        div()
+            .id("omarchy-gpui-audio-header")
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(if selected {
+                rgb(0x3f3f46)
+            } else {
+                rgb(0x27272a)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xa78bfa)
+            } else {
+                rgb(0x3f3f46)
+            })
+            .child("All audio")
+            .child(if any_audible { "ON" } else { "OFF" })
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.audio_focus_section = "header".to_string();
+                view.audio_selected_index = -1;
+                view.audio_cursor_active = true;
+                view.execute_async(SystemAction::ToggleOutputMute, "Toggling audio mute…", cx);
+                if !view.system.audio.sources.is_empty() {
+                    view.execute_async(SystemAction::ToggleInputMute, "Toggling input mute…", cx);
+                }
+            }))
+    }
+
     fn handle_gallery_key(
         &mut self,
         event: &KeyDownEvent,
@@ -2686,6 +3114,10 @@ impl PanelView {
         }
         if self.id == "omarchy.network" {
             self.handle_network_key(event, window, cx);
+            return;
+        }
+        if self.id == "omarchy.audio" {
+            self.handle_audio_key(event, window, cx);
             return;
         }
         if self.id == "omarchy.dev-gallery" {
@@ -4092,40 +4524,42 @@ impl PanelView {
                     ),
                 ));
                 content = content
+                    .child(self.audio_header_row(cx))
                     .child(panel_section_title("OUTPUT"))
-                    .child(panel_meter(
+                    .child(self.audio_slider_row(
+                        "output",
+                        "Output volume",
                         self.system.audio.output_percent,
                         self.system.audio.output_muted,
+                        cx,
                     ));
-                for node in &self.system.audio.sinks {
-                    content = content.child(panel_node_row(
-                        &node.description,
-                        node.volume,
-                        node.is_default,
-                        node.muted,
-                    ));
+                let sinks = self.system.audio.sinks.clone();
+                for (index, node) in sinks.iter().enumerate() {
+                    content = content.child(self.audio_node_row("output", index, node, cx));
                 }
-                if !self.system.audio.sources.is_empty() {
-                    content = content.child(panel_section_title("INPUT"));
-                    for node in &self.system.audio.sources {
-                        content = content.child(panel_node_row(
-                            &node.description,
-                            node.volume,
-                            node.is_default,
-                            node.muted,
-                        ));
+                if !self.system.audio.sources.is_empty()
+                    || self.system.audio.input_percent.is_some()
+                {
+                    content =
+                        content
+                            .child(panel_section_title("INPUT"))
+                            .child(self.audio_slider_row(
+                                "input",
+                                "Input volume",
+                                self.system.audio.input_percent,
+                                self.system.audio.input_muted,
+                                cx,
+                            ));
+                    let sources = self.system.audio.sources.clone();
+                    for (index, node) in sources.iter().enumerate() {
+                        content = content.child(self.audio_node_row("input", index, node, cx));
                     }
                 }
                 if !self.system.audio.streams.is_empty() {
                     content = content.child(panel_section_title("STREAMS"));
-                    for node in &self.system.audio.streams {
-                        let label = if node.application.is_empty() {
-                            &node.description
-                        } else {
-                            &node.application
-                        };
-                        content =
-                            content.child(panel_node_row(label, node.volume, false, node.muted));
+                    let streams = self.system.audio.streams.clone();
+                    for (index, node) in streams.iter().enumerate() {
+                        content = content.child(self.audio_node_row("streams", index, node, cx));
                     }
                 }
                 Some(content)
@@ -5464,16 +5898,6 @@ fn panel_meter(percent: Option<u8>, muted: bool) -> Div {
                         .w(px(fill_width)),
                 ),
         )
-}
-
-fn panel_node_row(label: &str, volume: Option<u8>, is_default: bool, muted: bool) -> Div {
-    let detail = format!(
-        "{}{}{}",
-        volume.map_or_else(|| "—".to_string(), |value| format!("{value}%")),
-        if muted { " · Muted" } else { "" },
-        if is_default { " · Default" } else { "" }
-    );
-    panel_text_row(label, &detail, is_default)
 }
 
 fn panel_text_row(label: &str, detail: &str, highlighted: bool) -> Div {
