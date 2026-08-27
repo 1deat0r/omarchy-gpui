@@ -9,9 +9,9 @@
 
 use std::{
     collections::BTreeSet,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -138,6 +138,7 @@ pub enum SystemAction {
         on_battery: bool,
     },
     SetNetworkBand(String),
+    SetDnsProvider(String),
     SetNightlight(bool),
     BluetoothDevice {
         action: BluetoothDeviceAction,
@@ -146,6 +147,17 @@ pub enum SystemAction {
     ConnectNetwork {
         ssid: String,
         device: String,
+    },
+    ConnectNetworkWithPassphrase {
+        ssid: String,
+        device: String,
+        passphrase: String,
+    },
+    ConnectEnterpriseNetwork {
+        ssid: String,
+        device: String,
+        identity: String,
+        passphrase: String,
     },
     DisconnectNetwork(String),
     ForgetNetwork(String),
@@ -260,6 +272,23 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             }
             command("omarchy-network-band", &[band]).map(|_| ())
         }
+        SystemAction::SetDnsProvider(provider) => {
+            if !matches!(
+                provider.as_str(),
+                "DHCP" | "Cloudflare" | "Google" | "Custom"
+            ) {
+                return Err("invalid DNS provider".to_string());
+            }
+            if provider == "Custom" {
+                Command::new("omarchy-launch-floating-terminal-with-presentation")
+                    .arg("omarchy-dns Custom")
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|error| format!("open custom DNS editor: {error}"))
+            } else {
+                command("omarchy-dns", &[provider]).map(|_| ())
+            }
+        }
         SystemAction::SetNightlight(enabled) => set_nightlight(*enabled),
         SystemAction::BluetoothDevice { action, address } => {
             validate_bluetooth_address(address)?;
@@ -281,6 +310,39 @@ pub fn run_action(action: &SystemAction) -> Result<(), String> {
             command(
                 "nmcli",
                 &["device", "wifi", "connect", ssid, "ifname", device],
+            )
+            .map(|_| ())
+        }
+        SystemAction::ConnectNetworkWithPassphrase {
+            ssid,
+            device,
+            passphrase,
+        } => {
+            validate_argument(ssid, "network SSID")?;
+            validate_argument(device, "network device")?;
+            validate_argument(passphrase, "network passphrase")?;
+            command_with_stdin(
+                "nmcli",
+                &["--ask", "device", "wifi", "connect", ssid, "ifname", device],
+                &format!("{passphrase}\n"),
+            )
+            .map(|_| ())
+        }
+        SystemAction::ConnectEnterpriseNetwork {
+            ssid,
+            device,
+            identity,
+            passphrase,
+        } => {
+            validate_argument(ssid, "network SSID")?;
+            validate_argument(device, "network device")?;
+            validate_argument(identity, "network identity")?;
+            validate_argument(passphrase, "network passphrase")?;
+            configure_enterprise_profile(ssid, device, identity)?;
+            command_with_stdin(
+                "nmcli",
+                &["--ask", "connection", "up", "id", ssid],
+                &format!("{passphrase}\n"),
             )
             .map(|_| ())
         }
@@ -316,6 +378,91 @@ fn command_present(program: &str) -> bool {
         .arg(program)
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+/// Run an interactive-looking command with a secret supplied on stdin. The
+/// secret is deliberately absent from argv and from the returned error text;
+/// `/proc/<pid>/cmdline` therefore cannot expose it while NetworkManager is
+/// authenticating the connection.
+fn command_with_stdin(program: &str, args: &[&str], input: &str) -> Result<String, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|error| format!("{program}: write stdin: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("{program} exited with {}", output.status)
+        } else {
+            format!("{program}: {detail}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn configure_enterprise_profile(ssid: &str, device: &str, identity: &str) -> Result<(), String> {
+    let profile_exists = Command::new("nmcli")
+        .args(["connection", "show", "id", ssid])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if profile_exists {
+        command(
+            "nmcli",
+            &[
+                "connection",
+                "modify",
+                ssid,
+                "connection.interface-name",
+                device,
+                "802-11-wireless-security.key-mgmt",
+                "wpa-eap",
+                "802-1x.eap",
+                "peap",
+                "802-1x.phase2-auth",
+                "mschapv2",
+                "802-1x.identity",
+                identity,
+            ],
+        )
+        .map(|_| ())
+    } else {
+        command(
+            "nmcli",
+            &[
+                "connection",
+                "add",
+                "type",
+                "wifi",
+                "ifname",
+                device,
+                "con-name",
+                ssid,
+                "ssid",
+                ssid,
+                "wifi-sec.key-mgmt",
+                "wpa-eap",
+                "802-1x.eap",
+                "peap",
+                "802-1x.phase2-auth",
+                "mschapv2",
+                "802-1x.identity",
+                identity,
+            ],
+        )
+        .map(|_| ())
+    }
 }
 
 fn media_action(method: &str, playerctl_args: &[&str]) -> Result<(), String> {
@@ -403,6 +550,7 @@ pub fn to_value(snapshot: &SystemSnapshot) -> Value {
                 "selected": snapshot.network.band.selected,
                 "available": snapshot.network.band.available,
             },
+            "dnsProvider": snapshot.network.dns_provider,
             "wifiNetworks": snapshot.network.wifi_networks.iter().map(|network| serde_json::json!({
                 "ssid": network.ssid,
                 "signalPercent": network.signal_percent,
@@ -961,6 +1109,7 @@ pub struct NetworkState {
     pub details: NetworkDetails,
     pub wifi_networks: Vec<WifiNetwork>,
     pub band: NetworkBand,
+    pub dns_provider: String,
     pub error: Option<String>,
 }
 
@@ -1018,6 +1167,37 @@ impl NetworkState {
         ) {
             network.wifi_networks = parse_nmcli_wifi_list(&raw);
         }
+        if let Ok(raw) = command(
+            "nmcli",
+            &[
+                "-t",
+                "--escape",
+                "no",
+                "-f",
+                "NAME,TYPE",
+                "connection",
+                "show",
+            ],
+        ) {
+            let known = parse_nmcli_saved_wifi_profiles(&raw);
+            for wifi in &mut network.wifi_networks {
+                wifi.known = known.iter().any(|name| name == &wifi.ssid);
+                if wifi.device.is_empty() {
+                    wifi.device = network.device.clone();
+                }
+            }
+        } else {
+            for wifi in &mut network.wifi_networks {
+                if wifi.device.is_empty() {
+                    wifi.device = network.device.clone();
+                }
+            }
+        }
+        network.dns_provider = command("omarchy-dns", &[])
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "DHCP".to_string());
         network
     }
 }
@@ -1216,6 +1396,20 @@ pub fn parse_nmcli_wifi_list(raw: &str) -> Vec<WifiNetwork> {
             .then_with(|| left.ssid.cmp(&right.ssid))
     });
     networks
+}
+
+pub fn parse_nmcli_saved_wifi_profiles(raw: &str) -> Vec<String> {
+    let mut profiles = raw
+        .lines()
+        .filter_map(|line| {
+            let (name, kind) = line.rsplit_once(':')?;
+            (kind.trim() == "802-11-wireless" && !name.trim().is_empty())
+                .then_some(name.trim().to_string())
+        })
+        .collect::<Vec<_>>();
+    profiles.sort();
+    profiles.dedup();
+    profiles
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1861,9 +2055,9 @@ mod tests {
         SystemAction, parse_battery_shell, parse_bluetooth_devices, parse_bluetooth_show,
         parse_hyprland, parse_monitor_state, parse_network_band, parse_network_status,
         parse_network_verbose, parse_nightlight_temperature, parse_nmcli_device_status,
-        parse_nmcli_radio_wifi, parse_nmcli_wifi_list, parse_playerctl_metadata,
-        parse_power_profiles, parse_pw_dump_audio, parse_system_stats, parse_text_size,
-        parse_upower_display, parse_wpctl_id, parse_wpctl_volume, run_action,
+        parse_nmcli_radio_wifi, parse_nmcli_saved_wifi_profiles, parse_nmcli_wifi_list,
+        parse_playerctl_metadata, parse_power_profiles, parse_pw_dump_audio, parse_system_stats,
+        parse_text_size, parse_upower_display, parse_wpctl_id, parse_wpctl_volume, run_action,
     };
 
     #[test]
@@ -2007,6 +2201,14 @@ mod tests {
     }
 
     #[test]
+    fn identifies_saved_wifi_profiles_without_losing_colons_in_names() {
+        let profiles = parse_nmcli_saved_wifi_profiles(
+            "STAR:LINK:802-11-wireless\nGuest:802-11-wireless\nlo:loopback\n",
+        );
+        assert_eq!(profiles, vec!["Guest", "STAR:LINK"]);
+    }
+
+    #[test]
     fn parses_bluetooth_power_and_connections() {
         let parsed = parse_bluetooth_show(
             "Controller AA:BB:CC:DD:EE:FF host [default]\n\tPowered: yes\n",
@@ -2112,6 +2314,27 @@ mod tests {
         assert_eq!(
             run_action(&SystemAction::SetNetworkBand("10".to_string())),
             Err("invalid network band".to_string())
+        );
+        assert_eq!(
+            run_action(&SystemAction::SetDnsProvider("Quad9".to_string())),
+            Err("invalid DNS provider".to_string())
+        );
+        assert_eq!(
+            run_action(&SystemAction::ConnectNetworkWithPassphrase {
+                ssid: "wifi".to_string(),
+                device: "wlan0".to_string(),
+                passphrase: "secret\nnot-valid".to_string(),
+            }),
+            Err("invalid network passphrase".to_string())
+        );
+        assert_eq!(
+            run_action(&SystemAction::ConnectEnterpriseNetwork {
+                ssid: "wifi".to_string(),
+                device: "wlan0".to_string(),
+                identity: "user\nnot-valid".to_string(),
+                passphrase: "secret".to_string(),
+            }),
+            Err("invalid network identity".to_string())
         );
         assert_eq!(
             run_action(&SystemAction::BluetoothDevice {
