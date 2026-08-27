@@ -1,6 +1,6 @@
 # Omarchy GPUI
 
-Gate status: **7/12 met** (5 remaining).
+Gate status: **9/12 met** (3 remaining).
 
 Parity status: **NOT MET**. This is a generated project status, not a completion claim.
 

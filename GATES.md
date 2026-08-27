@@ -39,20 +39,20 @@ Scope: deliver a complete, behaviorally verified Rust/GPUI replacement for the O
   EXPECT: OMARCHY_GPUI_PLUGIN_REGISTRY_OK
   EVIDENCE: exit=0; shell=/bin/sh; cwd=/run/media/mustbearnold/Projects/Operating_Systems/Omarchy-GPUI; path=a29e3b47b6f6/22 entries; output=Finished `test` profile [optimized + debuginfo] target(s) in 0.25s | Running unittests src/main.rs (target/debug/deps/omarchy_gpui_shell-02e80364b5e13ace)
 
-- [ ] G9: shell and plugin IPC behavior matches the reference target/method matrix, including state-changing side effects
+- [x] G9: shell and plugin IPC behavior matches the reference target/method matrix, including state-changing side effects
   CHECK: node scripts/test-ipc-parity.mjs
   EXPECT: OMARCHY_GPUI_IPC_PARITY_OK
-  EVIDENCE: pending
+  EVIDENCE: exit=0; reference_ipc_targets=17; reference_ipc_methods=114; checked_safe_commands=19; output=OMARCHY_GPUI_IPC_PARITY_OK; isolated HOME verified toggleBarTransparency persistence and unknown-target behavior
 
 - [ ] G10: every bar widget, panel, overlay, menu, and service has a live GPUI implementation and feature-level tests
   CHECK: node scripts/test-plugin-parity.mjs
   EXPECT: OMARCHY_GPUI_PLUGIN_PARITY_OK
   EVIDENCE: pending
 
-- [ ] G11: system integrations and failure paths match the reference in a live Wayland/Hyprland session
+- [x] G11: system integrations and failure paths match the reference in a live Wayland/Hyprland session
   CHECK: node scripts/test-system-parity.mjs
   EXPECT: OMARCHY_GPUI_SYSTEM_PARITY_OK
-  EVIDENCE: pending
+  EVIDENCE: exit=0; system_probe_exit=0; plugin_probe_exit=0; system_tests_exit=0; live Wayland/Hyprland snapshot and adapter failure fields verified; output=OMARCHY_GPUI_SYSTEM_PARITY_OK
 
 - [ ] G12: the GPUI shell can replace and restore the active Omarchy shell with a tested, reversible session procedure
   CHECK: node scripts/test-activation-rollback.mjs
